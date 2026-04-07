@@ -1,0 +1,1 @@
+# tratamentoDadosTelemetria
