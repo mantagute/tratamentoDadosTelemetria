@@ -14,6 +14,9 @@ ID 0x00000001 — acceleration_vector_x_y_1:
   VENTOR_LINEAR_ACC_X    b[0:2]  int16 LE  ×0.01  m/s²   (aceleração lateral)
   VENTOR_LINEAR_ACC_Y    b[4:6]  int16 LE  ×0.01  m/s²   (aceleração longitudinal)
 
+ID 0x18FF1515 — VCU_DATA_OUT:
+  APS_PERC               b[2:4]  uint16 LE  /100   %      (posição do pedal de acelerador)
+
 Para adicionar novos sinais, basta inserir entradas em CANDUMP_SIGNALS seguindo
 o mesmo padrão: nome → (can_id_int, byte_start, byte_len, signed, multiplier,
 offset, unidade, prioridade, phys_min, phys_max, delta_max_per_frame)
@@ -67,6 +70,10 @@ CANDUMP_SIGNALS = {
     #                          can_id      bs bl  sgn    mult   off  unit     prio  phys_min  phys_max  delta
     "VENTOR_LINEAR_ACC_X":  (0x00000001,  0,  2, True,  0.01,  0.0, "m/s²",  1,   -20.0,    20.0,     None),
     "VENTOR_LINEAR_ACC_Y":  (0x00000001,  4,  2, True,  0.01,  0.0, "m/s²",  1,   -20.0,    20.0,     None),
+    # VCU — pedal de acelerador
+    # bit(16-31) = bytes 2-3, little-endian, unsigned
+    # multiplier=0.01 (spec usa divisor 100), sem offset, range 0–100 %
+    "APS_PERC":             (0x18FF1515,  2,  2, False, 0.01,  0.0, "%",     1,    0.0,     100.0,    None),
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

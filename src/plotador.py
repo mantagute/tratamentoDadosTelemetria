@@ -56,6 +56,8 @@ META = {
     # Integrados — velo.py
     "VENTOR_LINEAR_VEL_X":    ("#79c0ff", "Velocidade Integrada X (lateral)",     "m/s"),
     "VENTOR_LINEAR_VEL_Y":    ("#56d364", "Velocidade Integrada Y (longitudinal)","m/s"),
+    # VCU — Pedal de acelerador (candump)
+    "APS_PERC":               ("#e3b341", "Pedal de Acelerador (APS)",            "%"),
 }
 DEFAULT_COLOR = "#8b949e"
 
