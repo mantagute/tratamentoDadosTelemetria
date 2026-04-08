@@ -29,13 +29,22 @@ PIPELINE DE PROCESSAMENTO
      veículo), que raramente excede 1–2 Hz em manobras normais.
      Usa filtfilt (zero-phase) para não introduzir defasagem de fase.
 
-  3. INTEGRAÇÃO TRAPEZOIDAL
+  3. DETECÇÃO DE JANELA DE MOVIMENTO
+     Antes de integrar, descarta os trechos em que a aceleração filtrada
+     fica próxima de zero de forma sustentada — indicando que o carro está
+     parado. A lógica segue a orientação do diretor: olhar a aceleração e
+     identificar onde ela começa a ficar positiva/negativa (saiu do zero) —
+     esse é o início do movimento. O inverso vale para o fim: onde ela volta
+     a ficar próxima de zero de forma sustentada marca onde o carro parou.
+     Tudo fora dessa janela é descartado antes da integração.
+
+  4. INTEGRAÇÃO TRAPEZOIDAL
      Integra a aceleração filtrada com o método trapezoidal, que é de segunda
      ordem em precisão para sinais suaves, usando os timestamps reais de cada
      amostra (lida diretamente do CSV, sem assumir taxa constante):
          vel[i] = vel[i-1] + 0.5 × (acc[i] + acc[i-1]) × Δt[i]
 
-  4. REMOÇÃO DE DRIFT RESIDUAL
+  5. REMOÇÃO DE DRIFT RESIDUAL
      Após a integração, subtrai uma rampa linear do início ao fim do sinal.
      Assume que a velocidade média da sessão deve ser ~0 (trajetória fechada
      ou movimento sem deslocamento líquido). Essa hipótese é razoável para
@@ -67,6 +76,19 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from scipy.signal import butter, filtfilt
+
+
+# ── Parâmetros de detecção de janela de movimento ────────────────────────────
+
+# Magnitude máxima da aceleração filtrada (m/s²) para considerar que o carro
+# está parado. O diretor orienta: olhar onde a aceleração começa a ficar
+# positiva/negativa saindo do zero (início) e onde volta a ficar próxima de
+# zero (fim). Ajuste se o sensor tiver ruído residual alto após o filtro.
+LIMIAR_REPOUSO = 0.05   # m/s²
+
+# Número mínimo de frames consecutivos abaixo do limiar para confirmar repouso.
+# Evita que um vale momentâneo no meio do movimento seja interpretado como parada.
+JANELA_REPOUSO = 10     # frames
 
 
 # ── Helpers de extração do campo 'dado' ──────────────────────────────────────
@@ -123,6 +145,54 @@ def montar_linha_csv(
     }
 
 
+# ── Detecção de janela de movimento ──────────────────────────────────────────
+
+def detectar_janela_movimento(
+    acc_filtrada: np.ndarray,
+    limiar: float = LIMIAR_REPOUSO,
+    janela: int = JANELA_REPOUSO,
+) -> tuple[int, int]:
+    """
+    Retorna (inicio_idx, fim_idx) da janela em que o carro está em movimento.
+
+    INÍCIO: avança do começo do sinal enquanto encontrar blocos de `janela`
+    frames consecutivos com magnitude abaixo de `limiar` (repouso). O primeiro
+    frame onde esse padrão não se repete é o início do movimento — onde a
+    aceleração começa a se afastar do zero de forma sustentada.
+
+    FIM: mesma lógica varrendo de trás para frente. O último trecho onde a
+    aceleração volta a ficar próxima de zero de forma sustentada marca onde
+    o carro parou.
+
+    Se a janela resultante for menor que 10 amostras, retorna o sinal completo
+    sem corte (sinal todo em repouso ou detecção inconclusiva).
+    """
+    magnitude = np.abs(acc_filtrada)
+    n = len(magnitude)
+
+    # Início: avança enquanto houver repouso sustentado
+    inicio_idx = 0
+    for i in range(n - janela):
+        if np.all(magnitude[i : i + janela] <= limiar):
+            inicio_idx = i + janela
+        else:
+            break
+
+    # Fim: recua enquanto houver repouso sustentado
+    fim_idx = n
+    for i in range(n - janela, inicio_idx, -1):
+        if np.all(magnitude[i : i + janela] <= limiar):
+            fim_idx = i
+        else:
+            break
+
+    if fim_idx - inicio_idx < 10:
+        print("  [warn] Janela de movimento não detectada; usando sinal completo.")
+        return 0, n
+
+    return inicio_idx, fim_idx
+
+
 # ── Pipeline de integração ────────────────────────────────────────────────────
 
 def processar_csv_aceleracao(caminho_csv: Path) -> None:
@@ -133,9 +203,10 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
       1. Carrega e valida o CSV.
       2. Estima e remove o bias estático do sensor.
       3. Aplica filtro Butterworth passa-baixa (4ª ordem, 3 Hz).
-      4. Integra por método trapezoidal com timestamps reais.
-      5. Remove drift linear residual.
-      6. Salva o CSV de velocidade.
+      4. Detecta e corta a janela de movimento (descarta repouso inicial e final).
+      5. Integra por método trapezoidal com timestamps reais.
+      6. Remove drift linear residual.
+      7. Salva o CSV de velocidade.
     """
     print(f"\n[velo] {caminho_csv.name}")
 
@@ -187,7 +258,21 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
     df["acc_filtrada"] = filtfilt(coef_b, coef_a, df["acc_corrigida"])
     print(f"  Fs detectada     : {taxa_amostragem:.2f} Hz  |  Cutoff filtro: {cutoff_hz} Hz")
 
-    # ── Etapa 4: Integração trapezoidal ──────────────────────────────────────
+    # ── Etapa 4: Detecção e corte da janela de movimento ─────────────────────
+    # Descarta amostras de repouso no início e no fim: onde a aceleração filtrada
+    # fica próxima de zero de forma sustentada, o carro está parado e integrar
+    # esse trecho só acumularia erro.
+    inicio_idx, fim_idx = detectar_janela_movimento(df["acc_filtrada"].to_numpy())
+
+    n_total  = len(df)
+    n_janela = fim_idx - inicio_idx
+    t_inicio = df["timestamp"].iloc[inicio_idx]
+    t_fim    = df["timestamp"].iloc[fim_idx - 1]
+    print(f"  Janela movimento : {t_inicio:.2f}s → {t_fim:.2f}s  [{n_janela}/{n_total} amostras]")
+
+    df = df.iloc[inicio_idx:fim_idx].reset_index(drop=True)
+
+    # ── Etapa 5: Integração trapezoidal ──────────────────────────────────────
     # Usa timestamps reais para lidar corretamente com taxas de amostragem
     # irregulares ou lacunas no log. Método trapezoidal é de 2ª ordem.
     velocidade = np.zeros(len(df))
@@ -198,7 +283,7 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
 
     df["velocidade"] = velocidade
 
-    # ── Etapa 5: Remoção de drift linear residual ─────────────────────────────
+    # ── Etapa 6: Remoção de drift linear residual ─────────────────────────────
     # Qualquer drift residual manifesta-se como uma tendência linear na velocidade.
     # Assume que a velocidade líquida ao final da sessão deve ser ~0
     # (válido para pista fechada ou teste de bancada).
@@ -209,7 +294,7 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
 
     print(f"  Velocidade final : {df['velocidade'].iloc[-1]:.4f} m/s")
 
-    # ── Etapa 6: Salvar CSV de velocidade ─────────────────────────────────────
+    # ── Etapa 7: Salvar CSV de velocidade ─────────────────────────────────────
     timestamps = df["timestamp"].to_numpy()
     valores_vel = df["velocidade"].to_numpy()
 
@@ -241,7 +326,6 @@ def main():
     # Aceita múltiplos argumentos e padrões glob (expandidos pelo shell ou pelo script)
     for argumento in sys.argv[1:]:
         caminho = Path(argumento)
-        # Se o argumento for um arquivo direto, usa-o; se for glob, expande
         lista_arquivos = [caminho] if caminho.exists() else sorted(Path().glob(argumento))
 
         for caminho_arquivo in lista_arquivos:
