@@ -1,42 +1,55 @@
 """
-extrator.py
------------
-Lê arquivos brutos e gera um CSV por sinal no formato padrão:
+extratorSessionFiles.py
+=======================
+Extrator de telemetria CAN a partir de arquivos de sessão no formato CSV.
 
+VISÃO GERAL
+-----------
+Os arquivos de sessão são CSVs gerados pelo datalogger embarcado. Cada linha
+representa uma mensagem CAN capturada, com colunas:
+
+    timestamp_unix, can_id_dec, b0, b1, b2, b3, b4, b5, b6, b7
+
+Este script lê esses arquivos, decodifica os sinais físicos de cada mensagem
+CAN de interesse e salva um CSV por sinal no diretório data/processed/.
+
+SINAIS SUPORTADOS
+-----------------
+Todos os sinais pertencem às mensagens dos inversores de tração A13 e B13
+(endereços CAN 0x18FF01F7 e 0x18FF02F7) e aos setpoints de torque enviados
+pelo VCU (endereços 0x18FFE180 e 0x18FFE280).
+
+    Sinal            | Bytes | Tipo    | Escala          | Unidade
+    ACT_SPEED_A13    | 1–2   | uint16  | raw − 32000     | rpm
+    ACT_TORQUE_A13   | 3–4   | uint16  | raw / 5 − 6400  | Nm
+    ACT_POWER_A13    | 5–6   | uint16  | raw / 200 − 160 | kW
+    ACT_TEMP_A13     | 7     | uint8   | raw − 40        | °C
+    (idem para B13)
+    SETP_TORQUE_A13  | 6–7   | uint16  | raw / 5 − 6400  | Nm
+    SETP_TORQUE_B13  | 6–7   | uint16  | raw / 5 − 6400  | Nm
+
+NOTA SOBRE ACT_SPEED
+--------------------
+Os bytes b[1:3] do firmware dos inversores apresentam oscilações de ~16.000 rpm
+entre frames consecutivos a 10 Hz durante operação — fisicamente impossível.
+Isso indica que o firmware grava outro dado nesses bytes enquanto opera sob carga
+(posição de encoder, contador de comutação ou dado de diagnóstico). O filtro de
+variação máxima (delta_max = 2000 rpm/frame) descarta essas amostras espúrias.
+Se a taxa de rejeição superar 20%, o sinal inteiro é marcado como inválido.
+
+SAÍDA
+-----
+    data/processed/<nome_do_arquivo_csv>/<SINAL>.csv
+    data/processed/<nome_do_arquivo_csv>/<SINAL>.invalid  (se suspeito)
+
+FORMATO DO CSV DE SAÍDA
+-----------------------
     names, timestamp, id_can, prioridade, dado
     ACT_TORQUE_A13, 946688468.12, 0x18FF01F7, 1, 25.00 Nm
 
-Saída: data/processed/<nome_arquivo>/<SINAL>.csv
-
-Sinais
-──────
-Session CSV:
-  ACT_SPEED_A13  / B13   rpm   b[1:3] signed  /1     offset 0
-  ACT_TORQUE_A13 / B13   Nm    b[3:5] signed  /5     offset -6400
-  ACT_POWER_A13  / B13   kW    b[5:7] signed  /200   offset -160
-  ACT_TEMP_A13   / B13   °C    b[6]   unsigned /1     offset -40
-
-
-Nota sobre encode:
-  Todos os sinais de valor físico usam signed 16-bit.
-  Fórmula: valor_real = raw / divisor + offset
-  Byte 0 de cada mensagem contém bits de status e é ignorado nos sinais de valor.
-  Os dados são little-endian (byte menos significativo primeiro).
-  Exceção: temperatura usa unsigned 8-bit + offset -40.
-
-Validação física (IMPORTANTE):
-  Cada sinal tem limites de range e de variação máxima entre frames
-  consecutivos (Δ_max). Amostras fora do range ou com Δ > Δ_max são
-  marcadas como NaN e não são salvas no CSV final.
-
-  Para ACT_SPEED em particular: os bytes b[1:3] do firmware apresentam
-  oscilações de ~16.000 rpm entre frames consecutivos a 10 Hz durante
-  a fase de operação — fisicamente impossível para qualquer motor. Isso
-  indica que o firmware grava outro dado (posição de encoder, contador
-  de comutação ou dado de diagnóstico) nesses bytes enquanto opera sob
-  carga. A validação descarta essas amostras; se a taxa de rejeição
-  superar INVALID_RATIO_THRESHOLD, o sinal inteiro é marcado como
-  inválido e um arquivo .invalid é gerado no lugar do CSV.
+USO
+---
+    python3 src/extratorSessionFiles.py
 """
 
 import struct
@@ -44,209 +57,311 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# ── Configuração ──────────────────────────────────────────────────────────────
 
-MIN_SIZE_KB             = 20
-INVALID_RATIO_THRESHOLD = 0.20   # ≥20 % de amostras inválidas → sinal suspeito
+# ── Parâmetros globais ────────────────────────────────────────────────────────
 
-def _find_base_dir() -> Path:
+# Arquivos menores que este limite são ignorados (provavelmente vazios ou corrompidos)
+TAMANHO_MINIMO_KB = 1000
+
+# Se ≥ 20% das amostras de um sinal forem rejeitadas pela validação física,
+# o sinal inteiro é considerado suspeito e não gera CSV
+LIMIAR_INVALIDADE = 0.20
+
+
+# ── Resolução de caminhos ─────────────────────────────────────────────────────
+
+def _resolver_diretorio_base() -> Path:
     """
-    Resolve BASE_DIR de forma robusta independente de onde o script foi colocado.
-    Testa candidatos em ordem e usa o primeiro que contém data/sessioncsvFiles.
-    Se nenhum for encontrado, usa o cwd e o main() reportará o caminho exato.
+    Localiza o diretório raiz do projeto de forma robusta, independente
+    de onde o script foi invocado (raiz, src/, ou qualquer subpasta).
+
+    Testa candidatos em ordem crescente de distância e retorna o primeiro
+    que contém a pasta data/sessioncsvFiles.
     """
-    script_dir = Path(__file__).resolve().parent
-    candidates = [
-        script_dir,           # script na raiz do projeto
-        script_dir.parent,    # script em src/ ou similar
-        Path.cwd(),           # diretório de trabalho atual
+    diretorio_script = Path(__file__).resolve().parent
+    candidatos = [
+        diretorio_script,         # script na raiz do projeto
+        diretorio_script.parent,  # script em src/ ou subpasta
+        Path.cwd(),               # diretório de trabalho atual
         Path.cwd().parent,
     ]
-    for c in candidates:
-        if (c / "data" / "sessioncsvFiles").exists():
-            return c
+    for candidato in candidatos:
+        if (candidato / "data" / "sessioncsvFiles").exists():
+            return candidato
     return Path.cwd()
 
-BASE_DIR    = _find_base_dir()
-SESSION_DIR = BASE_DIR / "data" / "raw" / "sessioncsvFiles"
-OUT_DIR     = BASE_DIR / "data" / "processed"
+
+DIR_BASE    = _resolver_diretorio_base()
+DIR_SESSOES = DIR_BASE / "data" / "raw" / "sessioncsvFiles"
+DIR_SAIDA   = DIR_BASE / "data" / "processed"
+
 
 # ── Mapa de sinais ────────────────────────────────────────────────────────────
-# nome → (can_id_int, byte_start, byte_len, signed, divisor, offset, unidade,
-#          prioridade, phys_min, phys_max, delta_max_per_frame)
 #
-# Fórmula: valor_real = raw / divisor + offset
+# Estrutura de cada entrada:
+#   nome_sinal → (
+#       can_id_int,        ID CAN como inteiro
+#       byte_inicio,       offset inicial no payload (bytes)
+#       byte_comprimento,  número de bytes a ler (1 ou 2)
+#       com_sinal,         True = int com sinal, False = unsigned
+#       divisor,           divide o valor bruto
+#       offset,            soma após a divisão
+#       unidade,           string da unidade física
+#       prioridade,        campo de prioridade no CSV de saída
+#       limite_minimo,     valor físico mínimo aceitável
+#       limite_maximo,     valor físico máximo aceitável
+#       delta_max_frame,   variação máxima aceitável entre dois frames (None = sem filtro)
+#   )
 #
-# Byte 0 de cada mensagem = bits de status → byte_start começa em 1
+# Fórmula de decodificação: valor_fisico = (raw / divisor) + offset
 #
-# delta_max_per_frame: variação física máxima aceitável entre dois frames
-# consecutivos. Para 10 Hz, regra conservadora = 10 % do range por frame.
-# None = sem filtro de variação.
+# O byte 0 de cada mensagem carrega bits de status do inversor e é ignorado
+# em todos os sinais de valor físico (byte_inicio começa em 1).
+# Os bytes são little-endian (byte menos significativo primeiro).
+# Temperatura usa uint8 com offset de -40 (padrão SAE J1939).
 
-SESSION_SIGNALS = {
-    #                  can_id      bs bl  sgn   div    off     unit  prio phys_min  phys_max  delta
-    "ACT_SPEED_A13":  (0x18FF01F7, 1, 2, False,  1,    -32000,     "rpm", 1, -32000,   33535,    2000),
-    "ACT_TORQUE_A13": (0x18FF01F7, 3, 2, False,  5,    -6400,  "Nm",  1, -6400,    6707,     None),
-    "ACT_POWER_A13":  (0x18FF01F7, 5, 2, False,  200,  -160,   "kW",  1, -160,     167.675,  None),
-    "ACT_TEMP_A13":   (0x18FF01F7, 7, 1, False, 1,    -40,    "°C",  1, -40,      215,      None),
-    "ACT_SPEED_B13":  (0x18FF02F7, 1, 2, False,  1,    -32000,     "rpm", 1, -32000,   33535,    2000),
-    "ACT_TORQUE_B13": (0x18FF02F7, 3, 2, False,  5,    -6400,  "Nm",  1, -6400,    6707,     None),
-    "ACT_POWER_B13":  (0x18FF02F7, 5, 2, False,  200,  -160,   "kW",  1, -160,     167.675,  None),
-    "ACT_TEMP_B13":   (0x18FF02F7, 7, 1, False, 1,    -40,    "°C",  1, -40,      215,      None),
-    "SETP_TORQUE_A13": (0x18FFE180, 6, 2, False, 5,    -6400,  "Nm",  1, -6400,    6707,     None),
-    "SETP_TORQUE_B13": (0x18FFE280, 6, 2, False, 5,    -6400,  "Nm",  1, -6400,    6707,     None),
+SINAIS_SESSAO = {
+    #                      can_id       ini  compr sgn   div    off     unit   prio  min       max        delta
+    "ACT_SPEED_A13":   (0x18FF01F7,  1,  2, False,   1, -32000, "rpm",  1, -32000,  33535,   2000),
+    "ACT_TORQUE_A13":  (0x18FF01F7,  3,  2, False,   5,  -6400, "Nm",   1,  -6400,   6707,   None),
+    "ACT_POWER_A13":   (0x18FF01F7,  5,  2, False, 200,   -160, "kW",   1,   -160,  167.675, None),
+    "ACT_TEMP_A13":    (0x18FF01F7,  7,  1, False,   1,    -40, "°C",   1,    -40,    215,   None),
+    "ACT_SPEED_B13":   (0x18FF02F7,  1,  2, False,   1, -32000, "rpm",  1, -32000,  33535,   2000),
+    "ACT_TORQUE_B13":  (0x18FF02F7,  3,  2, False,   5,  -6400, "Nm",   1,  -6400,   6707,   None),
+    "ACT_POWER_B13":   (0x18FF02F7,  5,  2, False, 200,   -160, "kW",   1,   -160,  167.675, None),
+    "ACT_TEMP_B13":    (0x18FF02F7,  7,  1, False,   1,    -40, "°C",   1,    -40,    215,   None),
+    "SETP_TORQUE_A13": (0x18FFE180,  6,  2, False,   5,  -6400, "Nm",   1,  -6400,   6707,   None),
+    "SETP_TORQUE_B13": (0x18FFE280,  6,  2, False,   5,  -6400, "Nm",   1,  -6400,   6707,   None),
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Decodificação de bytes ────────────────────────────────────────────────────
 
-_STRUCT_FMT = {
-    (1, True):  "b",
-    (1, False): "B",
-    (2, True):  "h",
-    (2, False): "H",
+# Mapeamento (comprimento_bytes, com_sinal) → formato struct little-endian
+_FORMATOS_STRUCT = {
+    (1, True):  "b",   # int8
+    (1, False): "B",   # uint8
+    (2, True):  "h",   # int16
+    (2, False): "H",   # uint16
 }
 
 
-def decode(data: bytes, bs: int, bl: int, signed: bool,
-           div: float, offset: float) -> float | None:
-    fmt = _STRUCT_FMT.get((bl, signed))
-    if fmt is None:
+def decodificar_payload(
+    payload: bytes,
+    byte_inicio: int,
+    byte_comprimento: int,
+    com_sinal: bool,
+    divisor: float,
+    offset: float,
+) -> float | None:
+    """
+    Extrai e converte um valor físico de um payload CAN.
+
+    Lê `byte_comprimento` bytes a partir de `byte_inicio` no payload,
+    interpreta como inteiro little-endian (com ou sem sinal) e aplica
+    a fórmula: valor_fisico = (raw / divisor) + offset.
+
+    Retorna None se o formato não for suportado ou se o payload for curto demais.
+    """
+    formato = _FORMATOS_STRUCT.get((byte_comprimento, com_sinal))
+    if formato is None:
         return None
+
+    if byte_inicio + byte_comprimento > len(payload):
+        return None
+
     try:
-        raw = struct.unpack_from("<" + fmt, data, bs)[0]
-        return round((raw / div) + offset, 4)
+        valor_bruto = struct.unpack_from("<" + formato, payload, byte_inicio)[0]
+        return round((valor_bruto / divisor) + offset, 4)
     except Exception:
         return None
 
 
-def size_ok(fp: Path) -> bool:
-    kb = fp.stat().st_size / 1024
-    if kb < MIN_SIZE_KB:
-        print(f"  [skip] {fp.name}  ({kb:.1f} KB < {MIN_SIZE_KB} KB mínimo)")
+# ── Verificação de tamanho ────────────────────────────────────────────────────
+
+def arquivo_tem_tamanho_valido(caminho: Path) -> bool:
+    """
+    Verifica se o arquivo tem pelo menos TAMANHO_MINIMO_KB.
+    Arquivos menores provavelmente não contêm dados de sessão úteis.
+    """
+    tamanho_kb = caminho.stat().st_size / 1024
+    if tamanho_kb < TAMANHO_MINIMO_KB:
+        print(f"  [skip] {caminho.name}  ({tamanho_kb:.1f} KB < {TAMANHO_MINIMO_KB} KB mínimo)")
         return False
     return True
 
 
-def to_row(name: str, ts: float, can_id: int,
-           prio: int, val: float, unit: str) -> dict:
+# ── Montagem de linhas do CSV de saída ───────────────────────────────────────
+
+def montar_linha_csv(
+    nome_sinal: str,
+    timestamp: float,
+    can_id: int,
+    prioridade: int,
+    valor: float,
+    unidade: str,
+) -> dict:
+    """
+    Retorna um dicionário no formato padrão do CSV de saída da pipeline.
+
+    O campo 'dado' combina o valor numérico e a unidade em uma única string
+    para facilitar a leitura humana e a identificação automática de unidade
+    no plotador.
+    """
     return {
-        "names":      name,
-        "timestamp":  round(ts, 6),
+        "names":      nome_sinal,
+        "timestamp":  round(timestamp, 6),
         "id_can":     f"0x{can_id:08X}",
-        "prioridade": prio,
-        "dado":       f"{val:.2f} {unit}",
+        "prioridade": prioridade,
+        "dado":       f"{valor:.2f} {unidade}",
     }
 
 
-def validate_signal(rows: list[dict], phys_min: float | None,
-                    phys_max: float | None, delta_max: float | None,
-                    sig_name: str) -> tuple[list[dict], dict]:
+# ── Validação física ──────────────────────────────────────────────────────────
+
+def validar_sinal(
+    linhas: list[dict],
+    limite_minimo: float | None,
+    limite_maximo: float | None,
+    delta_max: float | None,
+    nome_sinal: str,
+) -> tuple[list[dict], dict]:
     """
-    Filtra amostras fora do range físico ou com variação brusca entre frames.
+    Filtra amostras fisicamente impossíveis de um sinal.
 
-    Retorna (linhas_válidas, info_qualidade).
+    Aplica dois critérios de rejeição:
+      1. Range físico: valores fora de [limite_minimo, limite_maximo] são descartados.
+      2. Variação brusca: se |val[i] - val[i-1]| > delta_max, a amostra i é descartada.
+         Isso detecta saltos impostos por corrupção de dados ou comportamento
+         anômalo do firmware.
+
+    Retorna:
+      - lista de linhas válidas (passaram em ambos os critérios)
+      - dicionário com métricas de qualidade (n_total, n_invalido, ratio, suspeito)
     """
-    if not rows:
-        return rows, {}
+    if not linhas:
+        return linhas, {}
 
-    vals = np.array([float(r["dado"].split()[0]) for r in rows])
-    ts   = np.array([r["timestamp"] for r in rows])
-    n    = len(vals)
+    valores = np.array([float(r["dado"].split()[0]) for r in linhas])
+    n_total = len(valores)
 
-    # Máscara de validade (True = manter)
-    mask = np.ones(n, dtype=bool)
+    # Começa com todos válidos e vai removendo
+    mascara_valida = np.ones(n_total, dtype=bool)
 
-    # 1) Range físico
-    if phys_min is not None:
-        mask &= vals >= phys_min
-    if phys_max is not None:
-        mask &= vals <= phys_max
+    # Critério 1: range físico
+    if limite_minimo is not None:
+        mascara_valida &= valores >= limite_minimo
+    if limite_maximo is not None:
+        mascara_valida &= valores <= limite_maximo
 
-    # 2) Taxa de variação entre frames consecutivos
-    if delta_max is not None and n > 1:
-        diffs = np.abs(np.diff(vals))
-        # marca o frame 'depois' da variação brusca (mais conservador)
-        rapid = np.concatenate([[False], diffs > delta_max])
-        mask &= ~rapid
+    # Critério 2: variação entre frames consecutivos
+    if delta_max is not None and n_total > 1:
+        variacoes = np.abs(np.diff(valores))
+        # Marca o frame *depois* da variação brusca (posição mais conservadora)
+        saltos = np.concatenate([[False], variacoes > delta_max])
+        mascara_valida &= ~saltos
 
-    n_invalid = int((~mask).sum())
-    ratio     = n_invalid / n
+    n_invalidas = int((~mascara_valida).sum())
+    taxa_invalidade = n_invalidas / n_total
 
-    info = {
-        "n_total":    n,
-        "n_invalid":  n_invalid,
-        "ratio":      ratio,
-        "suspicious": ratio >= INVALID_RATIO_THRESHOLD,
+    metricas = {
+        "n_total":   n_total,
+        "n_invalido": n_invalidas,
+        "ratio":     taxa_invalidade,
+        "suspeito":  taxa_invalidade >= LIMIAR_INVALIDADE,
     }
 
-    valid_rows = [r for r, keep in zip(rows, mask) if keep]
-    return valid_rows, info
+    linhas_validas = [linha for linha, manter in zip(linhas, mascara_valida) if manter]
+    return linhas_validas, metricas
 
-# ── Session CSV ───────────────────────────────────────────────────────────────
 
-def process_session(fp: Path) -> dict[str, list]:
-    df = pd.read_csv(fp, skiprows=1)
-    df.columns = [c.strip() for c in df.columns]
+# ── Leitura do arquivo de sessão ─────────────────────────────────────────────
 
-    by_can: dict[int, list[str]] = {}
-    for sig, (can_id, *_) in SESSION_SIGNALS.items():
-        by_can.setdefault(can_id, []).append(sig)
+def processar_arquivo_sessao(caminho: Path) -> dict[str, list]:
+    """
+    Lê um CSV de sessão e decodifica todos os sinais mapeados em SINAIS_SESSAO.
 
-    result = {s: [] for s in SESSION_SIGNALS}
+    Estratégia de leitura:
+      - Agrupa os sinais por CAN ID para varrer o DataFrame uma vez por ID.
+      - Para cada linha do subset filtrado, monta o payload de 8 bytes a partir
+        das colunas b0–b7 e chama decodificar_payload() para cada sinal do grupo.
 
-    for can_id, sigs in by_can.items():
-        subset = df[df["can_id_dec"] == can_id]
-        for row in subset.itertuples(index=False):
-            payload = bytes([row.b0, row.b1, row.b2, row.b3,
-                             row.b4, row.b5, row.b6, row.b7])
-            ts = float(row.timestamp_unix)
-            for sig in sigs:
-                _, bs, bl, sgn, div, off, unit, prio, *_ = SESSION_SIGNALS[sig]
-                val = decode(payload, bs, bl, sgn, div, off)
-                if val is not None:
-                    result[sig].append(to_row(sig, ts, can_id, prio, val, unit))
+    Retorna um dicionário {nome_sinal: [lista de linhas CSV]}.
+    """
+    # A primeira linha do CSV de sessão é um cabeçalho de metadados (ignorado)
+    df = pd.read_csv(caminho, skiprows=1)
+    df.columns = [coluna.strip() for coluna in df.columns]
 
-    return result
+    # Agrupa sinais por CAN ID para minimizar iterações sobre o DataFrame
+    sinais_por_can_id: dict[int, list[str]] = {}
+    for nome_sinal, (can_id, *_) in SINAIS_SESSAO.items():
+        sinais_por_can_id.setdefault(can_id, []).append(nome_sinal)
 
+    resultado: dict[str, list] = {nome: [] for nome in SINAIS_SESSAO}
+
+    for can_id, sinais_do_id in sinais_por_can_id.items():
+        # Filtra apenas as mensagens deste CAN ID
+        mensagens = df[df["can_id_dec"] == can_id]
+
+        for linha in mensagens.itertuples(index=False):
+            # Reconstrói o payload de 8 bytes a partir das colunas individuais
+            payload = bytes([linha.b0, linha.b1, linha.b2, linha.b3,
+                             linha.b4, linha.b5, linha.b6, linha.b7])
+            timestamp = float(linha.timestamp_unix)
+
+            for nome_sinal in sinais_do_id:
+                _, byte_ini, byte_comp, com_sinal, divisor, offset, unidade, prio, *_ = SINAIS_SESSAO[nome_sinal]
+                valor = decodificar_payload(payload, byte_ini, byte_comp, com_sinal, divisor, offset)
+                if valor is not None:
+                    resultado[nome_sinal].append(
+                        montar_linha_csv(nome_sinal, timestamp, can_id, prio, valor, unidade)
+                    )
+
+    return resultado
 
 
 # ── Validação e salvamento ────────────────────────────────────────────────────
 
-def save(signals: dict[str, list],
-         spec_map: dict,
-         out_dir: Path) -> None:
+def salvar_sinais(
+    sinais: dict[str, list],
+    mapa_especificacoes: dict,
+    diretorio_saida: Path,
+) -> None:
     """
-    Valida cada sinal contra os limites físicos e Δ_max antes de salvar.
-    Sinais com taxa de invalidade ≥ INVALID_RATIO_THRESHOLD recebem um
-    arquivo .invalid descrevendo o problema em vez do CSV de dados.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    Valida e persiste cada sinal decodificado em disco.
 
-    for sig, rows in signals.items():
-        if not rows:
+    Para cada sinal:
+      - Executa a validação física (range + delta).
+      - Se a taxa de invalidade ≥ LIMIAR_INVALIDADE: gera arquivo .invalid com diagnóstico.
+      - Caso contrário: salva o CSV com as amostras válidas.
+
+    O arquivo .invalid substitui o CSV para sinalizar ao operador que o sinal
+    não deve ser usado sem revisão da especificação CAN ou do firmware.
+    """
+    diretorio_saida.mkdir(parents=True, exist_ok=True)
+
+    for nome_sinal, linhas in sinais.items():
+        if not linhas:
             continue
 
-        spec = spec_map.get(sig)
-        phys_min  = spec[8]  if spec else None
-        phys_max  = spec[9]  if spec else None
-        delta_max = spec[10] if spec else None
+        spec = mapa_especificacoes.get(nome_sinal)
+        limite_min = spec[8]  if spec else None
+        limite_max = spec[9]  if spec else None
+        delta_max  = spec[10] if spec else None
 
-        valid_rows, info = validate_signal(
-            rows, phys_min, phys_max, delta_max, sig
-        )
+        linhas_validas, metricas = validar_sinal(linhas, limite_min, limite_max, delta_max, nome_sinal)
 
-        if info.get("suspicious"):
-            # Não salva CSV — gera arquivo de alerta
-            alert_path = out_dir / f"{sig}.invalid"
-            n_t = info["n_total"]
-            n_i = info["n_invalid"]
-            pct = info["ratio"] * 100
-            alert_path.write_text(
-                f"SINAL INVÁLIDO: {sig}\n"
+        if metricas.get("suspeito"):
+            # Sinal com alta taxa de rejeição → arquivo de alerta
+            caminho_alerta = diretorio_saida / f"{nome_sinal}.invalid"
+            n_t  = metricas["n_total"]
+            n_i  = metricas["n_invalido"]
+            pct  = metricas["ratio"] * 100
+            caminho_alerta.write_text(
+                f"SINAL INVÁLIDO: {nome_sinal}\n"
                 f"  Total de amostras brutas : {n_t}\n"
                 f"  Amostras rejeitadas       : {n_i} ({pct:.1f}%)\n"
-                f"  Limiar de suspeita        : {INVALID_RATIO_THRESHOLD*100:.0f}%\n"
+                f"  Limiar de suspeita        : {LIMIAR_INVALIDADE * 100:.0f}%\n"
                 f"\n"
                 f"  Diagnóstico: a taxa de amostras fora do range físico ou com\n"
                 f"  variação brusca entre frames (Δ > {delta_max}) supera o limiar.\n"
@@ -254,57 +369,63 @@ def save(signals: dict[str, list],
                 f"  operação (e.g. contador de encoder, dado de diagnóstico).\n"
                 f"  Revise a especificação CAN ou o firmware antes de usar este sinal.\n"
             )
-            print(f"  [INVÁLIDO] {sig:<22}  {n_i}/{n_t} amostras rejeitadas ({pct:.1f}%)  →  {sig}.invalid")
-        elif valid_rows:
-            n_t = info.get("n_total", len(valid_rows))
-            n_i = info.get("n_invalid", 0)
-            pct_ok = (len(valid_rows) / n_t * 100) if n_t else 0
-            df = pd.DataFrame(valid_rows)
-            df.to_csv(out_dir / f"{sig}.csv", index=False)
-            if n_i > 0:
-                print(f"  [FILTRADO] {sig:<22}  {len(valid_rows)}/{n_t} pts salvos ({pct_ok:.1f}% válidos)")
+            print(f"  [INVÁLIDO] {nome_sinal:<22}  {n_i}/{n_t} amostras rejeitadas ({pct:.1f}%)  →  {nome_sinal}.invalid")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+        elif linhas_validas:
+            n_t    = metricas.get("n_total", len(linhas_validas))
+            n_i    = metricas.get("n_invalido", 0)
+            pct_ok = (len(linhas_validas) / n_t * 100) if n_t else 0
+            df_saida = pd.DataFrame(linhas_validas)
+            df_saida.to_csv(diretorio_saida / f"{nome_sinal}.csv", index=False)
+            if n_i > 0:
+                print(f"  [FILTRADO] {nome_sinal:<22}  {len(linhas_validas)}/{n_t} pts salvos ({pct_ok:.1f}% válidos)")
+
+
+# ── Ponto de entrada ──────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("  EXTRATOR DE TELEMETRIA CAN")
+    print("  EXTRATOR DE TELEMETRIA CAN — SESSION FILES")
     print("=" * 60)
-    print(f"  BASE_DIR   : {BASE_DIR}")
-    print(f"  SESSION_DIR: {SESSION_DIR}  {'[OK]' if SESSION_DIR.exists() else '[NAO ENCONTRADO]'}")
-    print(f"  OUT_DIR    : {OUT_DIR}")
+    print(f"  DIR_BASE   : {DIR_BASE}")
+    print(f"  SESSION_DIR: {DIR_SESSOES}  {'[OK]' if DIR_SESSOES.exists() else '[NAO ENCONTRADO]'}")
+    print(f"  OUT_DIR    : {DIR_SAIDA}")
     print("=" * 60)
 
-    if not SESSION_DIR.exists():
-        print(f"\n[ERRO] Pasta de sessoes nao encontrada: {SESSION_DIR}")
-        print("       Verifique se a estrutura data/sessioncsvFiles existe")
-        print("       a partir do diretorio onde o script esta localizado.")
+    if not DIR_SESSOES.exists():
+        print(f"\n[ERRO] Pasta de sessões não encontrada: {DIR_SESSOES}")
+        print("       Verifique se a estrutura data/raw/sessioncsvFiles existe")
+        print("       a partir do diretório onde o script está localizado.")
         return
 
-    for fp in sorted(SESSION_DIR.glob("*.csv")):
-        print(f"\n[session] {fp.name}  ({fp.stat().st_size/1024:.0f} KB)")
-        if not size_ok(fp):
+    arquivos_csv = sorted(DIR_SESSOES.glob("*.csv"))
+    if not arquivos_csv:
+        print("\n[ERRO] Nenhum arquivo .csv encontrado em SESSION_DIR.\n")
+        return
+
+    for caminho_arquivo in arquivos_csv:
+        print(f"\n[session] {caminho_arquivo.name}  ({caminho_arquivo.stat().st_size / 1024:.0f} KB)")
+        if not arquivo_tem_tamanho_valido(caminho_arquivo):
             continue
 
-        raw_signals = process_session(fp)
-        save(raw_signals, SESSION_SIGNALS, OUT_DIR / fp.stem)
+        sinais_brutos = processar_arquivo_sessao(caminho_arquivo)
+        diretorio_saida = DIR_SAIDA / caminho_arquivo.stem
+        salvar_sinais(sinais_brutos, SINAIS_SESSAO, diretorio_saida)
 
-        for sig, rows in raw_signals.items():
-            if not rows:
+        # Imprime estatísticas de frequência e duração para cada sinal válido
+        for nome_sinal, linhas in sinais_brutos.items():
+            if not linhas:
                 continue
-            spec       = SESSION_SIGNALS[sig]
-            valid, info = validate_signal(
-                rows, spec[8], spec[9], spec[10], sig
-            )
-            if info.get("suspicious"):
-                continue  # já reportado dentro de save()
-            if valid:
-                dur = valid[-1]["timestamp"] - valid[0]["timestamp"]
-                freq = len(valid) / dur if dur > 0 else 0
-                n_i  = info.get("n_invalid", 0)
-                flag = f"  [warn: {n_i} rejeitadas]" if n_i else ""
-                print(f"  {sig:<22}  {len(valid):>5} pts  |  {dur:.1f} s  |  {freq:.1f} Hz{flag}")
-
+            spec = SINAIS_SESSAO[nome_sinal]
+            linhas_validas, metricas = validar_sinal(linhas, spec[8], spec[9], spec[10], nome_sinal)
+            if metricas.get("suspeito"):
+                continue
+            if linhas_validas:
+                duracao = linhas_validas[-1]["timestamp"] - linhas_validas[0]["timestamp"]
+                frequencia_hz = len(linhas_validas) / duracao if duracao > 0 else 0
+                n_rejeitadas = metricas.get("n_invalido", 0)
+                aviso = f"  [warn: {n_rejeitadas} rejeitadas]" if n_rejeitadas else ""
+                print(f"  {nome_sinal:<22}  {len(linhas_validas):>5} pts  |  {duracao:.1f} s  |  {frequencia_hz:.1f} Hz{aviso}")
 
     print("\nPronto. CSVs em data/processed/<arquivo>/<SINAL>.csv\n")
     print("Sinais suspeitos geram arquivo .invalid no mesmo diretório.\n")

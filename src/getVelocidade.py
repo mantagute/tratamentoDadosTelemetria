@@ -1,29 +1,64 @@
 """
-velo.py
--------
-Recebe um CSV de aceleração no formato padrão do extrator e gera um CSV
-de velocidade no mesmo formato, pronto para o plotador.py.
+getVelocidade.py
+================
+Integrador de velocidade a partir de sinais de aceleração IMU.
 
-Uso:
-  python3 src/velo.py <caminho/para/SINAL_ACC.csv>
+VISÃO GERAL
+-----------
+Recebe um ou mais CSVs de aceleração no formato padrão da pipeline e gera
+um CSV de velocidade no mesmo formato, pronto para o plotador.
 
-  ex: python3 src/velo.py data/processed/candump-1999-12-31_230113/VENTOR_LINEAR_ACC_Y.csv
+A aceleração bruta de uma IMU nunca pode ser integrada diretamente: ruído
+de sensor, vibrações mecânicas e offsets de fabricação acumulam erro rapidamente,
+resultando em uma velocidade que deriva para infinito (problema clássico de
+"integration drift"). Este módulo implementa um pipeline de três etapas para
+mitigar esses problemas:
 
-Saída (mesma pasta do CSV de entrada):
-  <SINAL_VEL>.csv      — velocidade integrada (m/s)
+PIPELINE DE PROCESSAMENTO
+-------------------------
+  1. CORREÇÃO DE BIAS
+     Estima o offset estático do sensor calculando a média das amostras com
+     menor magnitude absoluta (percentil 5%). Em momentos de quasi-repouso,
+     a aceleração real é ~0; qualquer resíduo é erro do sensor (bias).
+     O bias estimado é subtraído de todas as amostras.
 
-Convenção de nomes:
+  2. FILTRO PASSA-BAIXA (Butterworth 4ª ordem, cutoff 3 Hz)
+     Remove ruído de alta frequência (vibrações, EMI, quantização do ADC)
+     que seria amplificado pela integração. O cutoff de 3 Hz preserva a
+     dinâmica longitudinal e lateral de interesse (aceleração/frenagem de
+     veículo), que raramente excede 1–2 Hz em manobras normais.
+     Usa filtfilt (zero-phase) para não introduzir defasagem de fase.
+
+  3. INTEGRAÇÃO TRAPEZOIDAL
+     Integra a aceleração filtrada com o método trapezoidal, que é de segunda
+     ordem em precisão para sinais suaves, usando os timestamps reais de cada
+     amostra (lida diretamente do CSV, sem assumir taxa constante):
+         vel[i] = vel[i-1] + 0.5 × (acc[i] + acc[i-1]) × Δt[i]
+
+  4. REMOÇÃO DE DRIFT RESIDUAL
+     Após a integração, subtrai uma rampa linear do início ao fim do sinal.
+     Assume que a velocidade média da sessão deve ser ~0 (trajetória fechada
+     ou movimento sem deslocamento líquido). Essa hipótese é razoável para
+     testes em pista ou bancada, mas deve ser revista para trajetórias abertas.
+
+CONVENÇÃO DE NOMES
+------------------
   VENTOR_LINEAR_ACC_X  →  VENTOR_LINEAR_VEL_X
   VENTOR_LINEAR_ACC_Y  →  VENTOR_LINEAR_VEL_Y
-  qualquer outro nome  →  <NOME>_VEL
+  qualquer outro nome  →  <NOME_ORIGINAL>_VEL
 
-Pipeline interno:
-  1. Carrega CSV e extrai valores numéricos da coluna 'dado'
-  2. Estima e remove bias (média dos 5% menores |acc|)
-  3. Aplica filtro Butterworth passa-baixa 4ª ordem (cutoff 3 Hz)
-  4. Integração trapezoidal → velocidade
-  5. Remoção de drift linear residual na velocidade
-  6. Salva CSV no formato padrão (names, timestamp, id_can, prioridade, dado)
+USO
+---
+  # Um arquivo:
+  python3 src/getVelocidade.py data/processed/candump-1999-12-31/VENTOR_LINEAR_ACC_Y.csv
+
+  # Múltiplos arquivos com glob:
+  python3 src/getVelocidade.py data/processed/candump-xyz/VENTOR_LINEAR_ACC_*.csv
+
+SAÍDA
+-----
+  Mesmo diretório do arquivo de entrada:
+  data/processed/<pasta>/<SINAL_VEL>.csv
 """
 
 import sys
@@ -33,129 +68,187 @@ import pandas as pd
 from pathlib import Path
 from scipy.signal import butter, filtfilt
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def extrair_numero(texto: str) -> float | None:
+# ── Helpers de extração do campo 'dado' ──────────────────────────────────────
+
+def extrair_valor_numerico(texto: str) -> float | None:
+    """
+    Extrai o valor numérico (incluindo sinal negativo) do campo 'dado'.
+    Exemplo: '-0.29 m/s²' → -0.29
+    """
     match = re.search(r"-?\d+\.?\d*", str(texto))
     return float(match.group()) if match else None
 
 
 def extrair_unidade(texto: str) -> str:
-    """Extrai a unidade do campo 'dado', ex: '-0.29 m/s²' → 'm/s²'."""
-    parts = str(texto).strip().split()
-    return parts[1] if len(parts) > 1 else ""
-
-
-def derivar_nome_vel(sig_acc: str) -> str:
     """
-    A partir do nome do sinal de aceleração, deriva o nome de velocidade.
-    ex: VENTOR_LINEAR_ACC_Y → VENTOR_LINEAR_VEL_Y
+    Extrai a unidade do campo 'dado'.
+    Exemplo: '-0.29 m/s²' → 'm/s²'
     """
-    upper = sig_acc.upper()
-    if "_ACC_" in upper:
-        suffix = upper.split("_ACC_")[-1]
-        return f"VENTOR_LINEAR_VEL_{suffix}"
-    return f"{upper}_VEL"
+    partes = str(texto).strip().split()
+    return partes[1] if len(partes) > 1 else ""
 
 
-def to_row(name: str, ts: float, can_id: str,
-           prio: int, val: float, unit: str) -> dict:
+def derivar_nome_velocidade(nome_sinal_acc: str) -> str:
+    """
+    Converte o nome de um sinal de aceleração no nome correspondente de velocidade.
+
+    Segue a convenção de nomenclatura VENTOR:
+      VENTOR_LINEAR_ACC_X → VENTOR_LINEAR_VEL_X
+      VENTOR_LINEAR_ACC_Y → VENTOR_LINEAR_VEL_Y
+      OUTRO_SINAL         → OUTRO_SINAL_VEL
+    """
+    nome_upper = nome_sinal_acc.upper()
+    if "_ACC_" in nome_upper:
+        sufixo = nome_upper.split("_ACC_")[-1]  # 'X' ou 'Y'
+        return f"VENTOR_LINEAR_VEL_{sufixo}"
+    return f"{nome_upper}_VEL"
+
+
+def montar_linha_csv(
+    nome_sinal: str,
+    timestamp: float,
+    can_id: str,
+    prioridade: int,
+    valor: float,
+    unidade: str,
+) -> dict:
+    """Retorna um dicionário no formato padrão do CSV de saída da pipeline."""
     return {
-        "names":      name,
-        "timestamp":  round(ts, 6),
+        "names":      nome_sinal,
+        "timestamp":  round(timestamp, 6),
         "id_can":     can_id,
-        "prioridade": prio,
-        "dado":       f"{val:.4f} {unit}",
+        "prioridade": prioridade,
+        "dado":       f"{valor:.4f} {unidade}",
     }
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
 
-def processar(csv_path: Path) -> None:
-    print(f"\n[velo] {csv_path.name}")
+# ── Pipeline de integração ────────────────────────────────────────────────────
 
-    # 1. Carregar
-    df = pd.read_csv(csv_path)
+def processar_csv_aceleracao(caminho_csv: Path) -> None:
+    """
+    Executa o pipeline completo de integração para um arquivo de aceleração.
+
+    Etapas:
+      1. Carrega e valida o CSV.
+      2. Estima e remove o bias estático do sensor.
+      3. Aplica filtro Butterworth passa-baixa (4ª ordem, 3 Hz).
+      4. Integra por método trapezoidal com timestamps reais.
+      5. Remove drift linear residual.
+      6. Salva o CSV de velocidade.
+    """
+    print(f"\n[velo] {caminho_csv.name}")
+
+    # ── Etapa 1: Carregar e preparar o DataFrame ──────────────────────────────
+    df = pd.read_csv(caminho_csv)
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    df["acc"]       = df["dado"].apply(extrair_numero)
-    df = df.dropna(subset=["timestamp", "acc"]).sort_values("timestamp").reset_index(drop=True)
+    df["aceleracao"] = df["dado"].apply(extrair_valor_numerico)
+
+    # Remove linhas com timestamp ou aceleração inválidos e ordena cronologicamente
+    df = (df
+          .dropna(subset=["timestamp", "aceleracao"])
+          .sort_values("timestamp")
+          .reset_index(drop=True))
 
     if len(df) < 10:
-        print("  [skip] amostras insuficientes.")
+        print("  [skip] Amostras insuficientes para integração confiável (mínimo: 10).")
         return
 
-    # metadados do sinal de origem para propagar nos CSVs de saída
-    sig_acc  = str(df["names"].iloc[0])
-    can_id   = str(df["id_can"].iloc[0])
-    prio     = int(df["prioridade"].iloc[0])
-    unit_acc = extrair_unidade(df["dado"].iloc[0])
+    # Extrai metadados do sinal de origem para propagar nos CSVs de saída
+    nome_sinal_acc = str(df["names"].iloc[0])
+    can_id         = str(df["id_can"].iloc[0])
+    prioridade     = int(df["prioridade"].iloc[0])
+    unidade_acc    = extrair_unidade(df["dado"].iloc[0])
+    nome_sinal_vel = derivar_nome_velocidade(nome_sinal_acc)
 
-    sig_vel = derivar_nome_vel(sig_acc)
+    # ── Etapa 2: Correção de bias estático ────────────────────────────────────
+    # O bias é estimado como a média das amostras com menor magnitude absoluta
+    # (percentil 5%). Em quasi-repouso, acc_real ≈ 0; o resíduo é erro do sensor.
+    magnitude_absoluta = df["aceleracao"].abs()
+    limiar_repouso     = np.percentile(magnitude_absoluta, 5)
+    amostras_repouso   = df.loc[magnitude_absoluta < limiar_repouso, "aceleracao"]
+    bias_estimado      = amostras_repouso.mean()
 
-    # 2. Bias
-    abs_acc   = df["acc"].abs()
-    threshold = np.percentile(abs_acc, 5)
-    bias      = df.loc[abs_acc < threshold, "acc"].mean()
-    df["acc_corr"] = df["acc"] - bias
-    print(f"  Bias estimado : {bias:.6f} {unit_acc}")
+    df["acc_corrigida"] = df["aceleracao"] - bias_estimado
+    print(f"  Bias estimado    : {bias_estimado:.6f} {unidade_acc}")
 
-    # 3. Filtro Butterworth passa-baixa
-    dt     = df["timestamp"].diff().mean()
-    fs     = 1.0 / dt
-    cutoff = 3.0   # Hz — dinâmica longitudinal/lateral típica
-    b, a   = butter(4, cutoff / (0.5 * fs), btype="low")
-    df["acc_filt"] = filtfilt(b, a, df["acc_corr"])
-    print(f"  Fs detectada  : {fs:.2f} Hz  |  cutoff filtro: {cutoff} Hz")
+    # ── Etapa 3: Filtro Butterworth passa-baixa ───────────────────────────────
+    # Estima a taxa de amostragem a partir dos intervalos de tempo reais.
+    # cutoff = 3 Hz captura dinâmica de veículo sem amplificar ruído de alta freq.
+    intervalo_medio_s = df["timestamp"].diff().mean()
+    taxa_amostragem   = 1.0 / intervalo_medio_s
+    cutoff_hz         = 3.0
+    frequencia_nyquist = 0.5 * taxa_amostragem
 
-    # 4. Integração trapezoidal → velocidade
-    vel = np.zeros(len(df))
+    # Coeficientes do filtro Butterworth de 4ª ordem
+    coef_b, coef_a = butter(4, cutoff_hz / frequencia_nyquist, btype="low")
+
+    # filtfilt aplica o filtro duas vezes (ida e volta) → fase zero, sem atraso
+    df["acc_filtrada"] = filtfilt(coef_b, coef_a, df["acc_corrigida"])
+    print(f"  Fs detectada     : {taxa_amostragem:.2f} Hz  |  Cutoff filtro: {cutoff_hz} Hz")
+
+    # ── Etapa 4: Integração trapezoidal ──────────────────────────────────────
+    # Usa timestamps reais para lidar corretamente com taxas de amostragem
+    # irregulares ou lacunas no log. Método trapezoidal é de 2ª ordem.
+    velocidade = np.zeros(len(df))
     for i in range(1, len(df)):
-        dt_i   = df["timestamp"][i] - df["timestamp"][i - 1]
-        vel[i] = vel[i - 1] + 0.5 * (df["acc_filt"][i] + df["acc_filt"][i - 1]) * dt_i
-    df["vel"] = vel
+        delta_t        = df["timestamp"][i] - df["timestamp"][i - 1]
+        media_acc      = 0.5 * (df["acc_filtrada"][i] + df["acc_filtrada"][i - 1])
+        velocidade[i]  = velocidade[i - 1] + media_acc * delta_t
 
-    # 5. Remoção de drift linear residual
-    df["vel"] = df["vel"] - df["vel"].mean()
-    df["vel"] = df["vel"] - df["vel"].iloc[0]
-    drift     = np.linspace(0, df["vel"].iloc[-1], len(df))
-    df["vel"] = df["vel"] - drift
+    df["velocidade"] = velocidade
 
-    print(f"  Velocidade final   : {df['vel'].iloc[-1]:.4f} m/s")
+    # ── Etapa 5: Remoção de drift linear residual ─────────────────────────────
+    # Qualquer drift residual manifesta-se como uma tendência linear na velocidade.
+    # Assume que a velocidade líquida ao final da sessão deve ser ~0
+    # (válido para pista fechada ou teste de bancada).
+    # Subtrai uma rampa linear proporcional ao valor final de velocidade.
+    rampa_drift      = np.linspace(0, df["velocidade"].iloc[-1], len(df))
+    df["velocidade"] = df["velocidade"] - rampa_drift
+    df["velocidade"] = df["velocidade"] - df["velocidade"].iloc[0]  # ancora em zero
 
-    # 6. Salvar CSV no formato padrão
-    out_dir = csv_path.parent
-    ts_arr  = df["timestamp"].to_numpy()
-    valores = df["vel"].to_numpy()
+    print(f"  Velocidade final : {df['velocidade'].iloc[-1]:.4f} m/s")
 
-    rows = [to_row(sig_vel, ts_arr[i], can_id, prio, valores[i], "m/s")
-            for i in range(len(df))]
-    
-    out_path = out_dir / f"{sig_vel}.csv"
-    pd.DataFrame(rows).to_csv(out_path, index=False)
-    print(f"  → {out_path.name}")
+    # ── Etapa 6: Salvar CSV de velocidade ─────────────────────────────────────
+    timestamps = df["timestamp"].to_numpy()
+    valores_vel = df["velocidade"].to_numpy()
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    linhas_csv = [
+        montar_linha_csv(nome_sinal_vel, timestamps[i], can_id, prioridade, valores_vel[i], "m/s")
+        for i in range(len(df))
+    ]
+
+    caminho_saida = caminho_csv.parent / f"{nome_sinal_vel}.csv"
+    pd.DataFrame(linhas_csv).to_csv(caminho_saida, index=False)
+    print(f"  → Salvo em: {caminho_saida.name}")
+
+
+# ── Ponto de entrada ──────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("  INTEGRADOR DE VELOCIDADE")
+    print("  INTEGRADOR DE VELOCIDADE — IMU")
     print("=" * 60)
 
     if len(sys.argv) < 2:
-        print("\nUso: python3 velo.py <caminho/para/SINAL_ACC.csv> [...]")
-        print("\nExemplo:")
-        print("  python3 src/velo.py data/processed/candump-1999-12-31_230113/VENTOR_LINEAR_ACC_Y.csv")
-        print("\nVários arquivos de uma vez:")
-        print("  python3 src/velo.py data/processed/candump-xyz/VENTOR_LINEAR_ACC_*.csv")
+        print("\nUso: python3 getVelocidade.py <caminho/para/SINAL_ACC.csv> [...]")
+        print("\nExemplos:")
+        print("  python3 src/getVelocidade.py data/processed/candump-1999-12-31/VENTOR_LINEAR_ACC_Y.csv")
+        print("  python3 src/getVelocidade.py data/processed/candump-xyz/VENTOR_LINEAR_ACC_*.csv")
+        print("\nO arquivo de saída é salvo no mesmo diretório do arquivo de entrada.")
         return
 
-    for arg in sys.argv[1:]:
-        p = Path(arg)
-        lista_arquivos = [p] if p.exists() else sorted(Path().glob(arg))
-        for fp in lista_arquivos:
-            if not fp.exists():
-                print(f"\n[ERRO] Arquivo não encontrado: {fp}")
+    # Aceita múltiplos argumentos e padrões glob (expandidos pelo shell ou pelo script)
+    for argumento in sys.argv[1:]:
+        caminho = Path(argumento)
+        # Se o argumento for um arquivo direto, usa-o; se for glob, expande
+        lista_arquivos = [caminho] if caminho.exists() else sorted(Path().glob(argumento))
+
+        for caminho_arquivo in lista_arquivos:
+            if not caminho_arquivo.exists():
+                print(f"\n[ERRO] Arquivo não encontrado: {caminho_arquivo}")
                 continue
-            processar(fp)
+            processar_csv_aceleracao(caminho_arquivo)
 
     print("\nPronto.\n")
 

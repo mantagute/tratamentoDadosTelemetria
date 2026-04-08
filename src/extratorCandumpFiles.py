@@ -1,34 +1,49 @@
 """
-extrator_candump.py
--------------------
-Lê arquivos no formato candump e gera um CSV por sinal no formato padrão:
+extratorCandumpFiles.py
+=======================
+Extrator de telemetria CAN a partir de arquivos no formato candump.
 
+VISÃO GERAL
+-----------
+O candump é uma ferramenta do pacote can-utils do Linux que registra o
+tráfego CAN diretamente do kernel. Cada linha do arquivo representa uma
+mensagem capturada no barramento, no seguinte formato:
+
+    (timestamp_unix) interface CANID#HEXDATA
+    (0946688473.192390) can0 00000001#E3FF000005000000
+
+Este script lê esses arquivos linha a linha, identifica as mensagens de
+interesse pelo CAN ID, decodifica os bytes do payload em valores físicos
+e salva um CSV por sinal no diretório data/processed/.
+
+SINAIS SUPORTADOS
+-----------------
+    Sinal               | ID CAN     | Bytes | Tipo   | Escala   | Unidade
+    VENTOR_LINEAR_ACC_X | 0x00000001 | 0–1   | int16  | × 0.01   | m/s²
+    VENTOR_LINEAR_ACC_Y | 0x00000001 | 4–5   | int16  | × 0.01   | m/s²
+    APS_PERC            | 0x18FF1515 | 2–3   | uint16 | × 0.01   | %
+
+NOTA SOBRE APS_PERC (pedal de acelerador)
+-----------------------------------------
+O sinal APS_PERC ocupa os bits 16–31 da mensagem VCU_DATA_OUT (bytes 2–3
+em notação little-endian). O fator de escala 0.01 corresponde ao divisor
+100 da especificação original: 10000 raw → 100.00%.
+
+SAÍDA
+-----
+    data/processed/<nome_do_arquivo_log>/<SINAL>.csv
+    data/processed/<nome_do_arquivo_log>/<SINAL>.invalid  (se suspeito)
+
+FORMATO DO CSV DE SAÍDA
+-----------------------
     names, timestamp, id_can, prioridade, dado
     VENTOR_LINEAR_ACC_X, 946688473.19, 0x00000001, 1, -0.29 m/s²
 
-Saída: data/processed/<nome_arquivo>/<SINAL>.csv
+USO
+---
+    python3 src/extratorCandumpFiles.py
 
-Sinais atualmente mapeados
-──────────────────────────
-ID 0x00000001 — acceleration_vector_x_y_1:
-  VENTOR_LINEAR_ACC_X    b[0:2]  int16 LE  ×0.01  m/s²   (aceleração lateral)
-  VENTOR_LINEAR_ACC_Y    b[4:6]  int16 LE  ×0.01  m/s²   (aceleração longitudinal)
-
-ID 0x18FF1515 — VCU_DATA_OUT:
-  APS_PERC               b[2:4]  uint16 LE  /100   %      (posição do pedal de acelerador)
-
-Para adicionar novos sinais, basta inserir entradas em CANDUMP_SIGNALS seguindo
-o mesmo padrão: nome → (can_id_int, byte_start, byte_len, signed, multiplier,
-offset, unidade, prioridade, phys_min, phys_max, delta_max_per_frame)
-
-Formato candump esperado:
-  (timestamp) interface CANID#HEXDATA
-  ex: (0946688473.192390) can0 00000001#E3FF000005000000
-
-Validação física:
-  Mesma lógica do extrator.py — amostras fora do range ou com Δ > delta_max
-  entre frames consecutivos são descartadas. Sinais com taxa de invalidade
-  ≥ INVALID_RATIO_THRESHOLD geram arquivo .invalid no lugar do CSV.
+    Coloque os arquivos .log em data/raw/candumpFiles/ antes de executar.
 """
 
 import re
@@ -37,258 +52,370 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# ── Configuração ──────────────────────────────────────────────────────────────
 
-MIN_SIZE_KB             = 1      # candump costuma ser menor que session CSV
-INVALID_RATIO_THRESHOLD = 0.20   # ≥20% de amostras inválidas → sinal suspeito
+# ── Parâmetros globais ────────────────────────────────────────────────────────
 
-def _find_base_dir() -> Path:
-    script_dir = Path(__file__).resolve().parent
-    candidates = [
-        script_dir,
-        script_dir.parent,
+# Arquivos candump costumam ser menores que session CSVs; limiar mais permissivo
+TAMANHO_MINIMO_KB = 1
+
+# Se ≥ 20% das amostras de um sinal forem rejeitadas pela validação física,
+# o sinal inteiro é considerado suspeito e não gera CSV
+LIMIAR_INVALIDADE = 0.20
+
+
+# ── Resolução de caminhos ─────────────────────────────────────────────────────
+
+def _resolver_diretorio_base() -> Path:
+    """
+    Localiza o diretório raiz do projeto de forma robusta, independente
+    de onde o script foi invocado.
+
+    Testa candidatos em ordem crescente de distância e retorna o primeiro
+    que contém a pasta data/. Se nenhum for encontrado, usa o cwd.
+    """
+    diretorio_script = Path(__file__).resolve().parent
+    candidatos = [
+        diretorio_script,
+        diretorio_script.parent,
         Path.cwd(),
         Path.cwd().parent,
     ]
-    for c in candidates:
-        if (c / "data").exists():
-            return c
+    for candidato in candidatos:
+        if (candidato / "data").exists():
+            return candidato
     return Path.cwd()
 
-BASE_DIR     = _find_base_dir()
-CANDUMP_DIR  = BASE_DIR / "data" / "raw" / "candumpFiles"
-OUT_DIR      = BASE_DIR / "data" / "processed"
+
+DIR_BASE    = _resolver_diretorio_base()
+DIR_CANDUMP = DIR_BASE / "data" / "raw" / "candumpFiles"
+DIR_SAIDA   = DIR_BASE / "data" / "processed"
+
 
 # ── Mapa de sinais ────────────────────────────────────────────────────────────
-# nome → (can_id_int, byte_start, byte_len, signed, multiplier, offset,
-#          unidade, prioridade, phys_min, phys_max, delta_max_per_frame)
 #
-# Fórmula: valor_real = raw * multiplier + offset
-# delta_max_per_frame: None = sem filtro de variação entre frames
+# Estrutura de cada entrada:
+#   nome_sinal → (
+#       can_id_int,        ID CAN como inteiro
+#       byte_inicio,       offset inicial no payload (bytes)
+#       byte_comprimento,  número de bytes a ler (1 ou 2)
+#       com_sinal,         True = int com sinal, False = unsigned
+#       multiplicador,     multiplica o valor bruto
+#       offset,            soma após a multiplicação
+#       unidade,           string da unidade física
+#       prioridade,        campo de prioridade no CSV de saída
+#       limite_minimo,     valor físico mínimo aceitável
+#       limite_maximo,     valor físico máximo aceitável
+#       delta_max_frame,   variação máxima aceitável entre dois frames (None = sem filtro)
+#   )
+#
+# Fórmula de decodificação: valor_fisico = (raw * multiplicador) + offset
+#
+# Diferença em relação ao extrator de sessão: aqui usa-se multiplicador
+# (em vez de divisor), pois os sinais IMU são especificados com fator ×.
 
-CANDUMP_SIGNALS = {
-    #                          can_id      bs bl  sgn    mult   off  unit     prio  phys_min  phys_max  delta
-    "VENTOR_LINEAR_ACC_X":  (0x00000001,  0,  2, True,  0.01,  0.0, "m/s²",  1,   -20.0,    20.0,     None),
-    "VENTOR_LINEAR_ACC_Y":  (0x00000001,  4,  2, True,  0.01,  0.0, "m/s²",  1,   -20.0,    20.0,     None),
-    # VCU — pedal de acelerador
-    # bit(16-31) = bytes 2-3, little-endian, unsigned
-    # multiplier=0.01 (spec usa divisor 100), sem offset, range 0–100 %
-    "APS_PERC":             (0x18FF1515,  2,  2, False, 0.01,  0.0, "%",     1,    0.0,     100.0,    None),
+SINAIS_CANDUMP = {
+    #                          can_id      ini compr sgn   mult  off  unit    prio  min    max    delta
+    "VENTOR_LINEAR_ACC_X":  (0x00000001,  0,  2, True,  0.01, 0.0, "m/s²", 1, -20.0, 20.0,  None),
+    "VENTOR_LINEAR_ACC_Y":  (0x00000001,  4,  2, True,  0.01, 0.0, "m/s²", 1, -20.0, 20.0,  None),
+    "APS_PERC":             (0x18FF1515,  2,  2, False, 0.01, 0.0, "%",    1,   0.0, 100.0, None),
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Regex para linha candump: (timestamp) interface CANID#HEXDATA
-_LINE_RE = re.compile(
+# ── Expressão regular para parsing do formato candump ────────────────────────
+
+# Captura os três grupos de cada linha válida do candump:
+#   Grupo 1: timestamp com ponto decimal (ex: 0946688473.192390)
+#   Grupo 2: CAN ID hexadecimal (ex: 00000001 ou 18FF1515)
+#   Grupo 3: payload hexadecimal (ex: E3FF000005000000)
+_REGEX_LINHA_CANDUMP = re.compile(
     r"^\((\d+\.\d+)\)\s+\S+\s+([0-9A-Fa-f]+)#([0-9A-Fa-f]+)\s*$"
 )
 
-_STRUCT_FMT = {
-    (1, True):  "b",
-    (1, False): "B",
-    (2, True):  "h",
-    (2, False): "H",
+# Mapeamento (comprimento_bytes, com_sinal) → formato struct little-endian
+_FORMATOS_STRUCT = {
+    (1, True):  "b",   # int8
+    (1, False): "B",   # uint8
+    (2, True):  "h",   # int16
+    (2, False): "H",   # uint16
 }
 
 
-def decode(data: bytes, bs: int, bl: int, signed: bool,
-           mult: float, offset: float) -> float | None:
-    fmt = _STRUCT_FMT.get((bl, signed))
-    if fmt is None:
+# ── Decodificação de bytes ────────────────────────────────────────────────────
+
+def decodificar_payload(
+    payload: bytes,
+    byte_inicio: int,
+    byte_comprimento: int,
+    com_sinal: bool,
+    multiplicador: float,
+    offset: float,
+) -> float | None:
+    """
+    Extrai e converte um valor físico de um payload CAN (formato candump).
+
+    Lê `byte_comprimento` bytes a partir de `byte_inicio` no payload,
+    interpreta como inteiro little-endian e aplica:
+        valor_fisico = (raw * multiplicador) + offset
+
+    Retorna None se o formato não for suportado ou o payload for curto demais.
+    """
+    formato = _FORMATOS_STRUCT.get((byte_comprimento, com_sinal))
+    if formato is None:
         return None
-    if bs + bl > len(data):
+
+    if byte_inicio + byte_comprimento > len(payload):
         return None
+
     try:
-        raw = struct.unpack_from("<" + fmt, data, bs)[0]
-        return round(raw * mult + offset, 4)
+        valor_bruto = struct.unpack_from("<" + formato, payload, byte_inicio)[0]
+        return round(valor_bruto * multiplicador + offset, 4)
     except Exception:
         return None
 
 
-def size_ok(fp: Path) -> bool:
-    kb = fp.stat().st_size / 1024
-    if kb < MIN_SIZE_KB:
-        print(f"  [skip] {fp.name}  ({kb:.1f} KB < {MIN_SIZE_KB} KB mínimo)")
+# ── Verificação de tamanho ────────────────────────────────────────────────────
+
+def arquivo_tem_tamanho_valido(caminho: Path) -> bool:
+    """
+    Verifica se o arquivo .log tem pelo menos TAMANHO_MINIMO_KB.
+    Arquivos menores provavelmente foram truncados ou não contêm dados.
+    """
+    tamanho_kb = caminho.stat().st_size / 1024
+    if tamanho_kb < TAMANHO_MINIMO_KB:
+        print(f"  [skip] {caminho.name}  ({tamanho_kb:.1f} KB < {TAMANHO_MINIMO_KB} KB mínimo)")
         return False
     return True
 
 
-def to_row(name: str, ts: float, can_id: int,
-           prio: int, val: float, unit: str) -> dict:
+# ── Montagem de linhas do CSV de saída ───────────────────────────────────────
+
+def montar_linha_csv(
+    nome_sinal: str,
+    timestamp: float,
+    can_id: int,
+    prioridade: int,
+    valor: float,
+    unidade: str,
+) -> dict:
+    """
+    Retorna um dicionário no formato padrão do CSV de saída da pipeline.
+    """
     return {
-        "names":      name,
-        "timestamp":  round(ts, 6),
+        "names":      nome_sinal,
+        "timestamp":  round(timestamp, 6),
         "id_can":     f"0x{can_id:08X}",
-        "prioridade": prio,
-        "dado":       f"{val:.2f} {unit}",
+        "prioridade": prioridade,
+        "dado":       f"{valor:.2f} {unidade}",
     }
 
 
-def validate_signal(rows: list[dict], phys_min: float | None,
-                    phys_max: float | None, delta_max: float | None,
-                    sig_name: str) -> tuple[list[dict], dict]:
+# ── Validação física ──────────────────────────────────────────────────────────
+
+def validar_sinal(
+    linhas: list[dict],
+    limite_minimo: float | None,
+    limite_maximo: float | None,
+    delta_max: float | None,
+    nome_sinal: str,
+) -> tuple[list[dict], dict]:
     """
-    Filtra amostras fora do range físico ou com variação brusca entre frames.
-    Retorna (linhas_válidas, info_qualidade).
+    Filtra amostras fisicamente impossíveis de um sinal.
+
+    Aplica dois critérios de rejeição:
+      1. Range físico: valores fora de [limite_minimo, limite_maximo] são descartados.
+      2. Variação brusca: se |val[i] - val[i-1]| > delta_max, a amostra i é descartada.
+
+    Retorna:
+      - lista de linhas válidas
+      - dicionário com métricas de qualidade (n_total, n_invalido, ratio, suspeito)
     """
-    if not rows:
-        return rows, {}
+    if not linhas:
+        return linhas, {}
 
-    vals = np.array([float(r["dado"].split()[0]) for r in rows])
-    n    = len(vals)
-    mask = np.ones(n, dtype=bool)
+    valores = np.array([float(r["dado"].split()[0]) for r in linhas])
+    n_total = len(valores)
 
-    if phys_min is not None:
-        mask &= vals >= phys_min
-    if phys_max is not None:
-        mask &= vals <= phys_max
+    mascara_valida = np.ones(n_total, dtype=bool)
 
-    if delta_max is not None and n > 1:
-        diffs = np.abs(np.diff(vals))
-        rapid = np.concatenate([[False], diffs > delta_max])
-        mask &= ~rapid
+    # Critério 1: range físico
+    if limite_minimo is not None:
+        mascara_valida &= valores >= limite_minimo
+    if limite_maximo is not None:
+        mascara_valida &= valores <= limite_maximo
 
-    n_invalid = int((~mask).sum())
-    ratio     = n_invalid / n
+    # Critério 2: variação entre frames consecutivos
+    if delta_max is not None and n_total > 1:
+        variacoes = np.abs(np.diff(valores))
+        saltos = np.concatenate([[False], variacoes > delta_max])
+        mascara_valida &= ~saltos
 
-    info = {
-        "n_total":    n,
-        "n_invalid":  n_invalid,
-        "ratio":      ratio,
-        "suspicious": ratio >= INVALID_RATIO_THRESHOLD,
+    n_invalidas = int((~mascara_valida).sum())
+    taxa_invalidade = n_invalidas / n_total
+
+    metricas = {
+        "n_total":    n_total,
+        "n_invalido": n_invalidas,
+        "ratio":      taxa_invalidade,
+        "suspeito":   taxa_invalidade >= LIMIAR_INVALIDADE,
     }
 
-    valid_rows = [r for r, keep in zip(rows, mask) if keep]
-    return valid_rows, info
+    linhas_validas = [linha for linha, manter in zip(linhas, mascara_valida) if manter]
+    return linhas_validas, metricas
 
-# ── Leitura do candump ────────────────────────────────────────────────────────
 
-def process_candump(fp: Path) -> dict[str, list]:
-    """Lê o arquivo candump linha a linha e extrai os sinais mapeados."""
+# ── Leitura do arquivo candump ────────────────────────────────────────────────
 
-    # agrupa sinais por CAN ID para uma única passagem no arquivo
-    by_can: dict[int, list[str]] = {}
-    for sig, (can_id, *_) in CANDUMP_SIGNALS.items():
-        by_can.setdefault(can_id, []).append(sig)
+def processar_arquivo_candump(caminho: Path) -> dict[str, list]:
+    """
+    Lê um arquivo candump linha a linha e decodifica todos os sinais mapeados.
 
-    result = {s: [] for s in CANDUMP_SIGNALS}
+    Estratégia de leitura:
+      - Pré-agrupa os sinais por CAN ID para evitar busca linear por sinal
+        a cada linha do arquivo (O(1) por lookup em vez de O(n_sinais)).
+      - Usa expressão regular compilada para parsing eficiente do formato candump.
+      - Linhas RTR (Remote Transmission Request) ou com payload inválido são
+        silenciosamente ignoradas (bytes.fromhex() lança ValueError).
 
-    with fp.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            m = _LINE_RE.match(line.strip())
-            if not m:
-                continue
+    Retorna um dicionário {nome_sinal: [lista de linhas CSV]}.
+    """
+    # Pré-índice: CAN ID → lista de nomes de sinais que pertencem a ele
+    sinais_por_can_id: dict[int, list[str]] = {}
+    for nome_sinal, (can_id, *_) in SINAIS_CANDUMP.items():
+        sinais_por_can_id.setdefault(can_id, []).append(nome_sinal)
 
-            ts_str, id_str, hex_data = m.groups()
+    resultado: dict[str, list] = {nome: [] for nome in SINAIS_CANDUMP}
+
+    with caminho.open("r", encoding="utf-8", errors="replace") as arquivo:
+        for linha in arquivo:
+            match = _REGEX_LINHA_CANDUMP.match(linha.strip())
+            if not match:
+                continue  # linha de comentário, vazia ou com formato diferente
+
+            timestamp_str, id_str, hex_payload = match.groups()
             can_id_int = int(id_str, 16)
 
-            sigs = by_can.get(can_id_int)
-            if not sigs:
+            # Ignora mensagens cujo CAN ID não tem sinal mapeado
+            sinais_do_id = sinais_por_can_id.get(can_id_int)
+            if not sinais_do_id:
                 continue
 
-            ts = float(ts_str)
+            timestamp = float(timestamp_str)
+
             try:
-                payload = bytes.fromhex(hex_data)
+                payload = bytes.fromhex(hex_payload)
             except ValueError:
-                # Ignora a linha se o payload contiver caracteres inválidos (ex: frames RTR ou Error)
+                # Frames RTR (sem payload) ou com caracteres inválidos
                 continue
 
-            for sig in sigs:
-                _, bs, bl, sgn, mult, off, unit, prio, *_ = CANDUMP_SIGNALS[sig]
-                val = decode(payload, bs, bl, sgn, mult, off)
-                if val is not None:
-                    result[sig].append(to_row(sig, ts, can_id_int, prio, val, unit))
+            for nome_sinal in sinais_do_id:
+                _, byte_ini, byte_comp, com_sinal, mult, off, unidade, prio, *_ = SINAIS_CANDUMP[nome_sinal]
+                valor = decodificar_payload(payload, byte_ini, byte_comp, com_sinal, mult, off)
+                if valor is not None:
+                    resultado[nome_sinal].append(
+                        montar_linha_csv(nome_sinal, timestamp, can_id_int, prio, valor, unidade)
+                    )
 
-    return result
+    return resultado
+
 
 # ── Validação e salvamento ────────────────────────────────────────────────────
 
-def save(signals: dict[str, list], spec_map: dict, out_dir: Path) -> None:
+def salvar_sinais(
+    sinais: dict[str, list],
+    mapa_especificacoes: dict,
+    diretorio_saida: Path,
+) -> None:
     """
-    Valida cada sinal e salva o CSV. Sinais suspeitos geram arquivo .invalid.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    Valida e persiste cada sinal decodificado em disco.
 
-    for sig, rows in signals.items():
-        if not rows:
+    Para sinais suspeitos (alta taxa de invalidade), gera um arquivo .invalid
+    com diagnóstico em vez do CSV. Isso garante que dados corrompidos não
+    entrem silenciosamente no pipeline de análise.
+    """
+    diretorio_saida.mkdir(parents=True, exist_ok=True)
+
+    for nome_sinal, linhas in sinais.items():
+        if not linhas:
             continue
 
-        spec      = spec_map.get(sig)
-        phys_min  = spec[8]  if spec else None
-        phys_max  = spec[9]  if spec else None
-        delta_max = spec[10] if spec else None
+        spec       = mapa_especificacoes.get(nome_sinal)
+        limite_min = spec[8]  if spec else None
+        limite_max = spec[9]  if spec else None
+        delta_max  = spec[10] if spec else None
 
-        valid_rows, info = validate_signal(rows, phys_min, phys_max, delta_max, sig)
+        linhas_validas, metricas = validar_sinal(linhas, limite_min, limite_max, delta_max, nome_sinal)
 
-        if info.get("suspicious"):
-            alert_path = out_dir / f"{sig}.invalid"
-            n_t = info["n_total"]
-            n_i = info["n_invalid"]
-            pct = info["ratio"] * 100
-            alert_path.write_text(
-                f"SINAL INVÁLIDO: {sig}\n"
+        if metricas.get("suspeito"):
+            caminho_alerta = diretorio_saida / f"{nome_sinal}.invalid"
+            n_t = metricas["n_total"]
+            n_i = metricas["n_invalido"]
+            pct = metricas["ratio"] * 100
+            caminho_alerta.write_text(
+                f"SINAL INVÁLIDO: {nome_sinal}\n"
                 f"  Total de amostras brutas : {n_t}\n"
                 f"  Amostras rejeitadas       : {n_i} ({pct:.1f}%)\n"
-                f"  Limiar de suspeita        : {INVALID_RATIO_THRESHOLD*100:.0f}%\n"
+                f"  Limiar de suspeita        : {LIMIAR_INVALIDADE * 100:.0f}%\n"
                 f"\n"
                 f"  Diagnóstico: a taxa de amostras fora do range físico ou com\n"
                 f"  variação brusca entre frames (Δ > {delta_max}) supera o limiar.\n"
                 f"  Revise a especificação CAN ou o firmware antes de usar este sinal.\n"
             )
-            print(f"  [INVÁLIDO] {sig:<26}  {n_i}/{n_t} amostras rejeitadas ({pct:.1f}%)  →  {sig}.invalid")
+            print(f"  [INVÁLIDO] {nome_sinal:<26}  {n_i}/{n_t} amostras rejeitadas ({pct:.1f}%)  →  {nome_sinal}.invalid")
 
-        elif valid_rows:
-            n_t    = info.get("n_total", len(valid_rows))
-            n_i    = info.get("n_invalid", 0)
-            pct_ok = (len(valid_rows) / n_t * 100) if n_t else 0
-            df = pd.DataFrame(valid_rows)
-            df.to_csv(out_dir / f"{sig}.csv", index=False)
+        elif linhas_validas:
+            n_t    = metricas.get("n_total", len(linhas_validas))
+            n_i    = metricas.get("n_invalido", 0)
+            pct_ok = (len(linhas_validas) / n_t * 100) if n_t else 0
+            df_saida = pd.DataFrame(linhas_validas)
+            df_saida.to_csv(diretorio_saida / f"{nome_sinal}.csv", index=False)
             if n_i > 0:
-                print(f"  [FILTRADO] {sig:<26}  {len(valid_rows)}/{n_t} pts salvos ({pct_ok:.1f}% válidos)")
+                print(f"  [FILTRADO] {nome_sinal:<26}  {len(linhas_validas)}/{n_t} pts salvos ({pct_ok:.1f}% válidos)")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Ponto de entrada ──────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
     print("  EXTRATOR DE TELEMETRIA CAN — CANDUMP")
     print("=" * 60)
-    print(f"  BASE_DIR    : {BASE_DIR}")
-    print(f"  CANDUMP_DIR : {CANDUMP_DIR}  {'[OK]' if CANDUMP_DIR.exists() else '[NAO ENCONTRADO]'}")
-    print(f"  OUT_DIR     : {OUT_DIR}")
+    print(f"  DIR_BASE    : {DIR_BASE}")
+    print(f"  CANDUMP_DIR : {DIR_CANDUMP}  {'[OK]' if DIR_CANDUMP.exists() else '[NAO ENCONTRADO]'}")
+    print(f"  OUT_DIR     : {DIR_SAIDA}")
     print("=" * 60)
 
-    if not CANDUMP_DIR.exists():
-        print(f"\n[ERRO] Pasta de candump não encontrada: {CANDUMP_DIR}")
+    if not DIR_CANDUMP.exists():
+        print(f"\n[ERRO] Pasta de candump não encontrada: {DIR_CANDUMP}")
         print("       Crie a pasta data/raw/candumpFiles e coloque os arquivos .log lá.")
         return
 
-    log_files = sorted(CANDUMP_DIR.glob("*.log"))
-    if not log_files:
+    arquivos_log = sorted(DIR_CANDUMP.glob("*.log"))
+    if not arquivos_log:
         print("\n[ERRO] Nenhum arquivo .log encontrado em CANDUMP_DIR.\n")
         return
 
-    for fp in log_files:
-        print(f"\n[candump] {fp.name}  ({fp.stat().st_size/1024:.0f} KB)")
-        if not size_ok(fp):
+    for caminho_arquivo in arquivos_log:
+        print(f"\n[candump] {caminho_arquivo.name}  ({caminho_arquivo.stat().st_size / 1024:.0f} KB)")
+        if not arquivo_tem_tamanho_valido(caminho_arquivo):
             continue
 
-        raw_signals = process_candump(fp)
-        out_dir     = OUT_DIR / fp.stem
-        save(raw_signals, CANDUMP_SIGNALS, out_dir)
+        sinais_brutos = processar_arquivo_candump(caminho_arquivo)
+        diretorio_saida = DIR_SAIDA / caminho_arquivo.stem
+        salvar_sinais(sinais_brutos, SINAIS_CANDUMP, diretorio_saida)
 
-        for sig, rows in raw_signals.items():
-            if not rows:
+        # Imprime estatísticas de frequência e duração para cada sinal válido
+        for nome_sinal, linhas in sinais_brutos.items():
+            if not linhas:
                 continue
-            spec        = CANDUMP_SIGNALS[sig]
-            valid, info = validate_signal(rows, spec[8], spec[9], spec[10], sig)
-            if info.get("suspicious"):
+            spec = SINAIS_CANDUMP[nome_sinal]
+            linhas_validas, metricas = validar_sinal(linhas, spec[8], spec[9], spec[10], nome_sinal)
+            if metricas.get("suspeito"):
                 continue
-            if valid:
-                dur  = valid[-1]["timestamp"] - valid[0]["timestamp"]
-                freq = len(valid) / dur if dur > 0 else 0
-                n_i  = info.get("n_invalid", 0)
-                flag = f"  [warn: {n_i} rejeitadas]" if n_i else ""
-                print(f"  {sig:<26}  {len(valid):>6} pts  |  {dur:.1f} s  |  {freq:.1f} Hz{flag}")
+            if linhas_validas:
+                duracao = linhas_validas[-1]["timestamp"] - linhas_validas[0]["timestamp"]
+                frequencia_hz = len(linhas_validas) / duracao if duracao > 0 else 0
+                n_rejeitadas = metricas.get("n_invalido", 0)
+                aviso = f"  [warn: {n_rejeitadas} rejeitadas]" if n_rejeitadas else ""
+                print(f"  {nome_sinal:<26}  {len(linhas_validas):>6} pts  |  {duracao:.1f} s  |  {frequencia_hz:.1f} Hz{aviso}")
 
     print("\nPronto. CSVs em data/processed/<arquivo>/<SINAL>.csv\n")
     print("Sinais suspeitos geram arquivo .invalid no mesmo diretório.\n")
