@@ -179,8 +179,12 @@ def process_candump(fp: Path) -> dict[str, list]:
             if not sigs:
                 continue
 
-            ts      = float(ts_str)
-            payload = bytes.fromhex(hex_data)
+            ts = float(ts_str)
+            try:
+                payload = bytes.fromhex(hex_data)
+            except ValueError:
+                # Ignora a linha se o payload contiver caracteres inválidos (ex: frames RTR ou Error)
+                continue
 
             for sig in sigs:
                 _, bs, bl, sgn, mult, off, unit, prio, *_ = CANDUMP_SIGNALS[sig]

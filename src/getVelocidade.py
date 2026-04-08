@@ -149,7 +149,9 @@ def main():
         return
 
     for arg in sys.argv[1:]:
-        for fp in sorted(Path().glob(arg)) or [Path(arg)]:
+        p = Path(arg)
+        lista_arquivos = [p] if p.exists() else sorted(Path().glob(arg))
+        for fp in lista_arquivos:
             if not fp.exists():
                 print(f"\n[ERRO] Arquivo não encontrado: {fp}")
                 continue
