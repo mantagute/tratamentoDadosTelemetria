@@ -12,8 +12,9 @@ gráfico de "cartão vermelho" explicitando o motivo da rejeição, em vez
 de serem silenciosamente omitidos.
 
 Uso:
-  python3 src/plotador.py                  # todos os arquivos
-  python3 src/plotador.py session_0055     # filtrar por nome
+  python3 src/plotador.py                        # todos os arquivos
+  python3 src/plotador.py session_0055           # filtrar por nome
+  python3 src/plotador.py candump-1999-12-31     # filtrar por nome
 """
 
 import sys
@@ -31,20 +32,30 @@ PROC_DIR = BASE_DIR / "data" / "processed"
 # ── Metadados visuais por sinal ───────────────────────────────────────────────
 
 META = {
-    "ACT_SPEED_A13":    ("#58a6ff", "Velocidade real — Motor A13"),
-    "ACT_TORQUE_A13":   ("#3fb950", "Torque real — Motor A13"),
-    "ACT_POWER_A13":    ("#ffa657", "Potência real — Motor A13"),
-    "ACT_TEMP_A13":     ("#f78166", "Temperatura — Motor A13"),
-    "ACT_SPEED_B13":    ("#79c0ff", "Velocidade real — Motor B13"),
-    "ACT_TORQUE_B13":   ("#56d364", "Torque real — Motor B13"),
-    "ACT_POWER_B13":    ("#ffb77a", "Potência real — Motor B13"),
-    "ACT_TEMP_B13":     ("#ffa198", "Temperatura — Motor B13"),
-    "SETP_TORQUE_13A":  ("#58a6ff", "Setpoint Torque — 13A"),
-    "SETP_RPM_13A":     ("#3fb950", "Setpoint RPM — 13A"),
-    "SETP_TORQUE_13B":  ("#ff7b72", "Setpoint Torque — 13B"),
-    "SETP_RPM_13B":     ("#ffa657", "Setpoint RPM — 13B"),
-    "SETP_TORQUE_A13":  ("#c9a0ff", "Setpoint Torque — Motor A13"),
-    "SETP_TORQUE_B13":  ("#d4a0ff", "Setpoint Torque — Motor B13"),
+    # Session — Motor A13
+    "ACT_SPEED_A13":          ("#58a6ff", "Velocidade real — Motor A13",          "rpm"),
+    "ACT_TORQUE_A13":         ("#3fb950", "Torque real — Motor A13",              "Nm"),
+    "ACT_POWER_A13":          ("#ffa657", "Potência real — Motor A13",            "kW"),
+    "ACT_TEMP_A13":           ("#f78166", "Temperatura — Motor A13",              "°C"),
+    # Session — Motor B13
+    "ACT_SPEED_B13":          ("#79c0ff", "Velocidade real — Motor B13",          "rpm"),
+    "ACT_TORQUE_B13":         ("#56d364", "Torque real — Motor B13",              "Nm"),
+    "ACT_POWER_B13":          ("#ffb77a", "Potência real — Motor B13",            "kW"),
+    "ACT_TEMP_B13":           ("#ffa198", "Temperatura — Motor B13",              "°C"),
+    # Session — Setpoints
+    "SETP_TORQUE_A13":        ("#c9a0ff", "Setpoint Torque — Motor A13",          "Nm"),
+    "SETP_TORQUE_B13":        ("#d4a0ff", "Setpoint Torque — Motor B13",          "Nm"),
+    # IMU — Aceleração (candump)
+    "VENTOR_LINEAR_ACC_X":    ("#58a6ff", "Aceleração Linear X (lateral)",        "m/s²"),
+    "VENTOR_LINEAR_ACC_Y":    ("#3fb950", "Aceleração Linear Y (longitudinal)",   "m/s²"),
+    "VENTOR_LINEAR_ACC_Z":    ("#ffa657", "Aceleração Linear Z (vertical)",       "m/s²"),
+    # IMU — Velocidade angular (candump)
+    "VENTOR_ANGULAR_SPEED_X": ("#f78166", "Velocidade Angular X",                 "rad/s"),
+    "VENTOR_ANGULAR_SPEED_Y": ("#ff7b72", "Velocidade Angular Y",                 "rad/s"),
+    "VENTOR_ANGULAR_SPEED_Z": ("#ffa657", "Velocidade Angular Z",                 "rad/s"),
+    # Integrados — velo.py
+    "VENTOR_LINEAR_VEL_X":    ("#79c0ff", "Velocidade Integrada X (lateral)",     "m/s"),
+    "VENTOR_LINEAR_VEL_Y":    ("#56d364", "Velocidade Integrada Y (longitudinal)","m/s"),
 }
 DEFAULT_COLOR = "#8b949e"
 
@@ -56,7 +67,6 @@ GRID_COL  = "#21262d"
 TEXT_COL  = "#e6edf3"
 MUTED     = "#8b949e"
 ERR_COLOR = "#da3633"
-WARN_COL  = "#d29922"
 
 plt.rcParams.update({
     "figure.facecolor": DARK_BG,
@@ -76,10 +86,9 @@ plt.rcParams.update({
 # ── Plot: sinal inválido ──────────────────────────────────────────────────────
 
 def plot_invalid(invalid_path: Path, plots_dir: Path) -> None:
-    """Gera um cartão de erro para sinais marcados como inválidos pelo extrator."""
-    sig     = invalid_path.stem
-    _, label = META.get(sig, (DEFAULT_COLOR, sig))
-    reason  = invalid_path.read_text(encoding="utf-8")
+    sig              = invalid_path.stem
+    color, label, _  = META.get(sig, (DEFAULT_COLOR, sig, ""))
+    reason           = invalid_path.read_text(encoding="utf-8")
 
     fig, ax = plt.subplots(figsize=(12, 3.6))
     ax.set_xlim(0, 1)
@@ -102,7 +111,7 @@ def plot_invalid(invalid_path: Path, plots_dir: Path) -> None:
     out = plots_dir / f"{sig}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=DARK_BG)
     plt.close(fig)
-    print(f"    [INVÁLIDO] {sig:<22}  →  plots/{sig}.png  (cartão de erro gerado)")
+    print(f"    [INVÁLIDO] {sig:<26}  →  plots/{sig}.png  (cartão de erro gerado)")
 
 # ── Plot: sinal válido ────────────────────────────────────────────────────────
 
@@ -123,13 +132,14 @@ def plot_signal(csv_path: Path, plots_dir: Path) -> None:
         return
 
     t0   = df["timestamp"].iloc[0]
-    t    = (df["timestamp"] - t0).to_numpy()   # ← conversão para numpy
-    y    = df["valor"].to_numpy()               # ← conversão para numpy
+    t    = (df["timestamp"] - t0).to_numpy()
+    y    = df["valor"].to_numpy()
     unit = df["unidade"].iloc[0]
     dur  = t[-1]
     freq = len(df) / dur if dur > 0 else 0
 
-    color, label = META.get(sig, (DEFAULT_COLOR, sig))
+    meta          = META.get(sig)
+    color, label  = (meta[0], meta[1]) if meta else (DEFAULT_COLOR, sig)
 
     fig, ax = plt.subplots(figsize=(12, 3.6))
     ax.plot(t, y, color=color, linewidth=1.2, alpha=0.92)
@@ -153,7 +163,7 @@ def plot_signal(csv_path: Path, plots_dir: Path) -> None:
     out = plots_dir / f"{sig}.png"
     fig.savefig(out, dpi=150, bbox_inches="tight", facecolor=DARK_BG)
     plt.close(fig)
-    print(f"    {sig:<22}  {len(df)} pts  |  {dur:.1f}s  |  {freq:.1f}Hz  →  plots/{sig}.png")
+    print(f"    {sig:<26}  {len(df)} pts  |  {dur:.1f}s  |  {freq:.1f}Hz  →  plots/{sig}.png")
 
 # ── Processa pasta ────────────────────────────────────────────────────────────
 
@@ -185,7 +195,7 @@ def main():
     filtro = sys.argv[1].strip() if len(sys.argv) > 1 else None
 
     if not PROC_DIR.exists():
-        print("\nNenhum dado encontrado. Execute o extrator.py primeiro.\n")
+        print("\nNenhum dado encontrado. Execute o extrator primeiro.\n")
         return
 
     folders = sorted(
@@ -194,7 +204,7 @@ def main():
     )
 
     if not folders:
-        print("\nNenhum dado encontrado. Execute extrator.py primeiro.\n")
+        print("\nNenhum dado encontrado. Execute o extrator primeiro.\n")
         return
 
     for folder in folders:
