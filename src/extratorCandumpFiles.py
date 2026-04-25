@@ -18,16 +18,27 @@ e salva um CSV por sinal no diretório data/processed/.
 
 SINAIS SUPORTADOS
 -----------------
-    Sinal               | ID CAN     | Bytes | Tipo   | Escala   | Unidade
-    VENTOR_LINEAR_ACC_X | 0x00000001 | 0–1   | int16  | × 0.01   | m/s²
-    VENTOR_LINEAR_ACC_Y | 0x00000001 | 4–5   | int16  | × 0.01   | m/s²
-    APS_PERC            | 0x18FF1515 | 2–3   | uint16 | × 0.01   | %
+    Mensagem                  | CAN ID     | Sinal                  | Bytes | Tipo   | Escala | Unidade
+    acceleration_vector_x_y_1 | 0x00000001 | VENTOR_LINEAR_ACC_X    | 0–1   | int16  | × 0.01 | m/s²
+    acceleration_vector_x_y_1 | 0x00000001 | VENTOR_ANGULAR_SPEED_X | 2–3   | int16  | × 0.01 | rad/s
+    acceleration_vector_x_y_1 | 0x00000001 | VENTOR_LINEAR_ACC_Y    | 4–5   | int16  | × 0.01 | m/s²
+    acceleration_vector_x_y_1 | 0x00000001 | VENTOR_ANGULAR_SPEED_Y | 6–7   | int16  | × 0.01 | rad/s
+    acceleration_vector_z_2   | 0x00000002 | VENTOR_LINEAR_ACC_Z    | 0–1   | int16  | × 0.01 | m/s²
+    acceleration_vector_z_2   | 0x00000002 | VENTOR_ANGULAR_SPEED_Z | 2–3   | int16  | × 0.01 | rad/s
+    VCU_DATA_OUT              | 0x18FF1515 | APS_PERC               | 2–3   | uint16 | × 0.01 | %
 
 NOTA SOBRE APS_PERC (pedal de acelerador)
 -----------------------------------------
 O sinal APS_PERC ocupa os bits 16–31 da mensagem VCU_DATA_OUT (bytes 2–3
 em notação little-endian). O fator de escala 0.01 corresponde ao divisor
 100 da especificação original: 10000 raw → 100.00%.
+
+NOTA SOBRE VENTOR_ANGULAR_SPEED_Z (yaw rate)
+--------------------------------------------
+A convenção de sinal NÃO está confirmada: positivo pode ser horário ou
+anti-horário visto de cima, dependendo da orientação de montagem da IMU
+no chassi. Validar com uma curva de referência (ex: curva à direita) e
+registrar a convenção antes de usar em getTrajetoria.py.
 
 SAÍDA
 -----
@@ -114,10 +125,31 @@ DIR_SAIDA   = DIR_BASE / "data" / "processed"
 # (em vez de divisor), pois os sinais IMU são especificados com fator ×.
 
 SINAIS_CANDUMP = {
-    #                          can_id      ini compr sgn   mult  off  unit    prio  min    max    delta
-    "VENTOR_LINEAR_ACC_X":  (0x00000001,  0,  2, True,  0.01, 0.0, "m/s²", 1, -20.0, 20.0,  None),
-    "VENTOR_LINEAR_ACC_Y":  (0x00000001,  4,  2, True,  0.01, 0.0, "m/s²", 1, -20.0, 20.0,  None),
-    "APS_PERC":             (0x18FF1515,  2,  2, False, 0.01, 0.0, "%",    1,   0.0, 100.0, None),
+    #                             can_id      ini compr sgn   mult  off  unit      prio  min    max    delta
+
+    # ── Mensagem 0x00000001: acceleration_vector_x_y_1 ───────────────────────
+    # Layout: [ACC_X(0-1)] [ANG_SPEED_X(2-3)] [ACC_Y(4-5)] [ANG_SPEED_Y(6-7)]
+    "VENTOR_LINEAR_ACC_X":    (0x00000001,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    # NOTA: angular_speed_x mede rotação em torno do eixo X (rolamento/roll).
+    # Sentido positivo: não confirmado. Validar com manobra de referência
+    # (inclinar o veículo para a direita e verificar o sinal resultante).
+    "VENTOR_ANGULAR_SPEED_X": (0x00000001,  2,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
+    "VENTOR_LINEAR_ACC_Y":    (0x00000001,  4,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    # NOTA: angular_speed_y mede rotação em torno do eixo Y (arfagem/pitch).
+    # Sentido positivo: não confirmado.
+    "VENTOR_ANGULAR_SPEED_Y": (0x00000001,  6,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
+
+    # ── Mensagem 0x00000002: acceleration_vector_z_2 ─────────────────────────
+    "VENTOR_LINEAR_ACC_Z":    (0x00000002,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    # NOTA CRÍTICA — convenção de sinal do yaw NÃO confirmada.
+    # Positivo pode ser horário ou anti-horário visto de cima dependendo da
+    # montagem da IMU no chassi. Validar antes de usar em getTrajetoria.py:
+    # fazer uma curva à direita e verificar se angular_speed_z é positiva ou
+    # negativa. Registrar a convenção aqui e no TRAJECTORY.md após confirmação.
+    "VENTOR_ANGULAR_SPEED_Z": (0x00000002,  2,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
+
+    # ── VCU — Pedal de acelerador ─────────────────────────────────────────────
+    "APS_PERC":               (0x18FF1515,  2,  2, False, 0.01, 0.0, "%",     1,   0.0, 100.0, None),
 }
 
 
