@@ -129,18 +129,18 @@ SINAIS_CANDUMP = {
 
     # ── Mensagem 0x00000001: acceleration_vector_x_y_1 ───────────────────────
     # Layout: [ACC_X(0-1)] [ANG_SPEED_X(2-3)] [ACC_Y(4-5)] [ANG_SPEED_Y(6-7)]
-    "VENTOR_LINEAR_ACC_X":    (0x00000001,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    #"VENTOR_LINEAR_ACC_X":    (0x00000001,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
     # NOTA: angular_speed_x mede rotação em torno do eixo X (rolamento/roll).
     # Sentido positivo: não confirmado. Validar com manobra de referência
     # (inclinar o veículo para a direita e verificar o sinal resultante).
     "VENTOR_ANGULAR_SPEED_X": (0x00000001,  2,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
-    "VENTOR_LINEAR_ACC_Y":    (0x00000001,  4,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    #"VENTOR_LINEAR_ACC_Y":    (0x00000001,  4,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
     # NOTA: angular_speed_y mede rotação em torno do eixo Y (arfagem/pitch).
     # Sentido positivo: não confirmado.
     "VENTOR_ANGULAR_SPEED_Y": (0x00000001,  6,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
 
     # ── Mensagem 0x00000002: acceleration_vector_z_2 ─────────────────────────
-    "VENTOR_LINEAR_ACC_Z":    (0x00000002,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
+    #"VENTOR_LINEAR_ACC_Z":    (0x00000002,  0,  2, True,  0.01, 0.0, "m/s²",  1, -20.0, 20.0,  None),
     # NOTA CRÍTICA — convenção de sinal do yaw NÃO confirmada.
     # Positivo pode ser horário ou anti-horário visto de cima dependendo da
     # montagem da IMU no chassi. Validar antes de usar em getTrajetoria.py:
@@ -149,7 +149,7 @@ SINAIS_CANDUMP = {
     "VENTOR_ANGULAR_SPEED_Z": (0x00000002,  2,  2, True,  0.01, 0.0, "rad/s", 1, -20.0, 20.0,  None),
 
     # ── VCU — Pedal de acelerador ─────────────────────────────────────────────
-    "APS_PERC":               (0x18FF1515,  2,  2, False, 0.01, 0.0, "%",     1,   0.0, 100.0, None),
+    #"APS_PERC":               (0x18FF1515,  2,  2, False, 0.01, 0.0, "%",     1,   0.0, 100.0, None),
 }
 
 

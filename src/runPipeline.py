@@ -11,21 +11,27 @@ de telemetria. Ele executa os módulos da pipeline na ordem correta:
     [1] extratorSessionFiles.py  → decodifica session CSVs
     [2] extratorCandumpFiles.py  → decodifica logs candump
     [3] getVelocidade.py         → integra aceleração → velocidade
-    [4] plotador.py              → gera gráficos de todos os sinais
+    [4] getTrajetoria.py         → integra yaw + velocidade → posição x, y
+    [5] plotador.py              → gera gráficos de todos os sinais
 
 Cada etapa é executada como subprocesso independente, o que garante
 isolamento de estado e facilita depuração (falhas ficam localizadas).
 
 FLAGS DISPONÍVEIS
 -----------------
-  --skip-extract   Pula os extratores e o integrador (etapas 1, 2 e 3).
+  --skip-extract   Pula os extratores e os integradores (etapas 1, 2, 3 e 4).
                    Útil quando os CSVs já foram gerados e você quer apenas
                    replotá-los após ajustar o plotador.
 
-  --skip-plot      Pula o plotador (etapa 4). Útil para extrair dados sem
+  --skip-plot      Pula o plotador (etapa 5). Útil para extrair dados sem
                    gerar gráficos (ex: ambiente sem display ou matplotlib).
 
   --only-plot      Atalho para --skip-extract: executa apenas o plotador.
+
+  --negar-yaw      Repassa a flag --negar-yaw para getTrajetoria.py. Use se
+                   a trajetória gerada sair espelhada em relação ao esperado
+                   (indica que o sentido positivo do giroscópio é invertido
+                   em relação à convenção adotada no dead reckoning).
 
 USO
 ---
@@ -33,6 +39,7 @@ USO
   python3 src/runPipeline.py --skip-extract   # só plota dados já extraídos
   python3 src/runPipeline.py --skip-plot      # extrai sem plotar
   python3 src/runPipeline.py --only-plot      # plota sem extrair
+  python3 src/runPipeline.py --negar-yaw      # pipeline completa com yaw negado
 """
 
 import sys
@@ -42,14 +49,15 @@ from pathlib import Path
 
 # ── Caminhos dos módulos da pipeline ─────────────────────────────────────────
 
-DIR_BASE = Path(__file__).resolve().parent.parent  # raiz do projeto
-DIR_SRC  = DIR_BASE / "src"
+DIR_BASE       = Path(__file__).resolve().parent.parent  # raiz do projeto
+DIR_SRC        = DIR_BASE / "src"
 DIR_PROCESSADO = DIR_BASE / "data" / "processed"
 
-SCRIPT_EXTRATOR_SESSION  = DIR_SRC / "extratorSessionFiles.py"
-SCRIPT_EXTRATOR_CANDUMP  = DIR_SRC / "extratorCandumpFiles.py"
-SCRIPT_GET_VELOCIDADE    = DIR_SRC / "getVelocidade.py"
-SCRIPT_PLOTADOR          = DIR_SRC / "plotador.py"
+SCRIPT_EXTRATOR_SESSION = DIR_SRC / "extratorSessionFiles.py"
+SCRIPT_EXTRATOR_CANDUMP = DIR_SRC / "extratorCandumpFiles.py"
+SCRIPT_GET_VELOCIDADE   = DIR_SRC / "getVelocidade.py"
+SCRIPT_GET_TRAJETORIA   = DIR_SRC / "getTrajetoria.py"
+SCRIPT_PLOTADOR         = DIR_SRC / "plotador.py"
 
 
 # ── Execução de subprocessos ──────────────────────────────────────────────────
@@ -84,6 +92,23 @@ def localizar_csvs_de_aceleracao() -> list[Path]:
     if not DIR_PROCESSADO.exists():
         return []
     return sorted(DIR_PROCESSADO.glob("**/VENTOR_LINEAR_ACC_*.csv"))
+
+
+def localizar_diretorios_de_sessao() -> list[Path]:
+    """
+    Busca diretórios de sessão que contenham tanto VENTOR_LINEAR_VEL_Y.csv
+    quanto VENTOR_ANGULAR_SPEED_Z.csv — sinais necessários para getTrajetoria.py.
+    """
+    if not DIR_PROCESSADO.exists():
+        return []
+    diretorios = []
+    for pasta in sorted(DIR_PROCESSADO.iterdir()):
+        if pasta.is_dir():
+            tem_vel = (pasta / "VENTOR_LINEAR_VEL_Y.csv").exists()
+            tem_yaw = (pasta / "VENTOR_ANGULAR_SPEED_Z.csv").exists()
+            if tem_vel and tem_yaw:
+                diretorios.append(pasta)
+    return diretorios
 
 
 # ── Etapas da pipeline ────────────────────────────────────────────────────────
@@ -126,8 +151,40 @@ def etapa_calcular_velocidade() -> bool:
     return resultado.returncode == 0
 
 
+def etapa_calcular_trajetoria(negar_yaw: bool = False) -> bool:
+    """
+    Etapa 4: reconstrói a trajetória 2D por dead reckoning.
+
+    Localiza diretórios de sessão que contenham VENTOR_LINEAR_VEL_Y.csv e
+    VENTOR_ANGULAR_SPEED_Z.csv e passa cada um para getTrajetoria.py.
+    """
+    diretorios = localizar_diretorios_de_sessao()
+
+    if not diretorios:
+        print("\n[trajetoria] Nenhuma sessão com VEL_Y + ANGULAR_SPEED_Z encontrada.")
+        print("             Verifique se getVelocidade.py e extratorCandumpFiles.py rodaram.")
+        # Não é erro fatal — sessões sem IMU podem existir
+        return True
+
+    print(f"\n{'=' * 60}")
+    print(f"  getTrajetoria — {len(diretorios)} sessão(ões) encontrada(s)")
+    print(f"{'=' * 60}")
+    for d in diretorios:
+        print(f"  {d.relative_to(DIR_BASE)}")
+
+    flags_extras = ["--negar-yaw"] if negar_yaw else []
+
+    resultado = subprocess.run(
+        [sys.executable, str(SCRIPT_GET_TRAJETORIA),
+         *[str(d) for d in diretorios],
+         *flags_extras],
+        cwd=str(DIR_BASE),
+    )
+    return resultado.returncode == 0
+
+
 def etapa_plotar() -> bool:
-    """Etapa 4: gera gráficos de todos os sinais em data/processed/."""
+    """Etapa 5: gera gráficos de todos os sinais em data/processed/."""
     return executar_script(SCRIPT_PLOTADOR)
 
 
@@ -139,6 +196,7 @@ def main():
     # Resolve combinações de flags
     pular_extratores = "--skip-extract" in flags or "--only-plot" in flags
     pular_plotador   = "--skip-plot" in flags
+    negar_yaw        = "--negar-yaw" in flags
 
     # Monta a sequência de etapas com base nas flags
     etapas = []
@@ -147,6 +205,7 @@ def main():
         etapas.append(("Extrator Session",  etapa_extrair_sessoes))
         etapas.append(("Extrator Candump",  etapa_extrair_candump))
         etapas.append(("Integrador Velo",   etapa_calcular_velocidade))
+        etapas.append(("Trajetória",        lambda: etapa_calcular_trajetoria(negar_yaw)))
 
     if not pular_plotador:
         etapas.append(("Plotador",          etapa_plotar))
@@ -155,6 +214,8 @@ def main():
     print("  PIPELINE DE TELEMETRIA CAN")
     print("=" * 60)
     print(f"  Etapas: {', '.join(nome for nome, _ in etapas)}")
+    if negar_yaw:
+        print("  [flag] --negar-yaw ativo")
 
     # Executa cada etapa em sequência; interrompe na primeira falha
     for nome_etapa, funcao_etapa in etapas:
