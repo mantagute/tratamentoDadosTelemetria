@@ -1,4 +1,12 @@
-.DS_STORE
+.DS_Store
 *.log
 *.csv
 *.png
+
+# Frontend artifacts gerados pelo pipeline de mapa
+data/processed/*/frontend/
+data/processed/*/frontend/track_timeline.json
+
+# Cache Python
+__pycache__/
+*.py[cod]

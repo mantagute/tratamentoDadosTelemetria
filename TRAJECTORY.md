@@ -233,6 +233,207 @@ A `runPipeline.py` **repassa** essas flags quando presentes em `sys.argv`.
 
 ---
 
+## Validação com dados sintéticos perfeitos
+
+Para separar erro de algoritmo de ruído real, foi adicionado o gerador:
+
+`src/gerarDadosPerfeitos.py`
+
+Ele cria uma sessão sintética com sinais fisicamente coerentes entre si:
+- `ACT_SPEED_A13/B13` (RPM ideal)
+- `VENTOR_LINEAR_ACC_X` (aceleração longitudinal ideal)
+- `VENTOR_ANGULAR_SPEED_Z` (yaw rate ideal)
+- `REF_TRAJETORIA_X/Y` (trajetória de referência “ground truth”)
+
+### Objetivo do teste
+
+Validar em ambiente controlado:
+- se o mapa 2D é plotado com geometria correta;
+- se o tracking no mapa base da primeira volta acompanha a posição corretamente;
+- se o erro de fechamento fica baixo quando não há ruído.
+
+### Protocolo de execução
+
+```bash
+python3 src/gerarDadosPerfeitos.py --saida sintetico-perfeito
+python3 src/getTrajetoria.py data/processed/sintetico-perfeito --lap-period-sec 40 --bias-yaw-bordas-sec 1
+python3 src/plotador.py sintetico-perfeito
+```
+
+### Critérios de aceite (regra de negócio)
+
+- O plot `TRAJETORIA_2D.png` deve mostrar trajetória fechada e estável (sem deformação progressiva entre voltas).
+- O arquivo `MAPA_BASE_X.csv/Y.csv` deve existir quando o tracking estiver ativo.
+- O erro de fechamento reportado no `getTrajetoria.py` deve ser baixo (ordem de poucos metros ou menos; idealmente próximo de zero nesse cenário).
+- Referência atual do teste sintético (21/05/2026): erro de fechamento `~0.14 m` com `--bias-yaw-bordas-sec 1`.
+- O traçado reconstruído (`TRAJETORIA_X/Y`) deve permanecer aderente ao mapa base ao longo das voltas.
+
+Se os critérios acima forem atendidos no sintético e falharem no real, a próxima etapa deve focar em:
+- redução de ruído (filtro/parametrização),
+- bias de yaw em repouso real,
+- sincronização temporal,
+- mitigação da propagação de erro por integração.
+
+---
+
+## Execução real — diagnóstico de MAPA_BASE (21/05/2026)
+
+### Comandos executados
+
+Detecção automática de período:
+
+```bash
+python3 src/getTrajetoria.py data/processed/candump-* --bias-yaw-bordas-sec 3
+```
+
+Tentativa com período fixo:
+
+```bash
+python3 src/getTrajetoria.py data/processed/candump-* --lap-period-sec 45 --bias-yaw-bordas-sec 3
+```
+
+### Resultado observado
+
+Sessões sem `MAPA_BASE` na detecção automática:
+- `candump-1999-12-31_230112`
+- `candump-1999-12-31_230113`
+- `candump-1999-12-31_230123`
+- `candump-1999-12-31_230132`
+- `candump-1999-12-31_230140`
+- `candump-1999-12-31_230143`
+- `candump-1999-12-31_230150`
+
+Motivos reportados pelo próprio `getTrajetoria.py`:
+- `pico_autocorr_fraco`: série de velocidade sem periodicidade forte o bastante para inferir volta.
+- `duracao_ou_fs_insuficiente`: janela útil curta para estimar período.
+
+Após fixar `--lap-period-sec 45`, `MAPA_BASE` passou a existir em parte dos casos (ex.: `230113`, `230123`, `230140`), mas não em todos.
+
+Motivo dos que ainda falharam com período fixo:
+- `duracao_curta_para_multiplas_voltas`: após sobreposição entre sinais, a janela efetiva ficou curta para a regra atual de map/tracking.
+
+### Por que sessões “grandes” podem não gerar mapa
+
+A decisão não usa a duração bruta do arquivo. Usa a duração da **grade comum** (interseção temporal entre velocidade e yaw). Em vários casos, apesar de log longo, a sobreposição útil ficou curta (ex.: 10 s, 29 s, 41 s), impedindo mapa/tracking.
+
+### Como arrumar na prática
+
+1. Sempre verificar a linha `Grade comum` no log do `getTrajetoria.py` (não apenas a duração total do arquivo).
+2. Rodar com `--lap-period-sec` quando o auto falhar por `pico_autocorr_fraco`.
+3. Ajustar o período por sessão (ex.: 45/50/55) e escolher o que reduz fechamento da 1ª volta.
+4. Revisar o recorte da sessão para aumentar a sobreposição `VEL × YAW`.
+5. Priorizar entrada com `RPM + ACC_X` (modo fusão) em vez de fallback `VEL_X + YAW`, pois a periodicidade de velocidade fica mais robusta.
+
+### Validação do teste sintético
+
+Teste sintético confirmado funcional para validar algoritmo e plotagem:
+
+```bash
+python3 src/gerarDadosPerfeitos.py --saida sintetico-perfeito
+python3 src/getTrajetoria.py data/processed/sintetico-perfeito --lap-period-sec 40 --bias-yaw-bordas-sec 1
+python3 src/plotador.py sintetico-perfeito
+```
+
+Referência observada na execução: erro de fechamento ~`0.14 m`, com geração de `MAPA_BASE_X/Y`.
+Isso confirma que, em dado coerente e sem ruído, mapa e tracking funcionam; problemas remanescentes no real são majoritariamente de qualidade/compatibilidade de sinal e janela útil.
+
+---
+
+## Integração com frontend/backend (status atual)
+
+### Acesso ao Telemetria
+
+No ambiente local atual foi encontrado `TelemetriaV2.0` (não foi localizado `TelemetriaV2.1`).
+No `V2.0`, o painel `TrackMapPanel` ainda consome uma `source` de imagem (`<img src=...>`), então o caminho mais rápido é servir um PNG de mapa.
+
+### Nova etapa de exportação para frontend
+
+Foi adicionado o script:
+
+`src/exportMapaFrontend.py`
+
+Ele gera, por sessão:
+- `frontend/track_map.png` (mapa para o painel atual)
+- `frontend/track_timeline.json` (timeline de posição para evolução futura do cockpit)
+
+Estrutura de saída:
+
+`data/processed/<sessao>/frontend/`
+
+### Pipeline recomendada para produção de mapa no frontend
+
+1. Rodar reconstrução de trajetória (com `MAPA_BASE` quando possível).
+2. Exportar artefatos frontend.
+3. Servir `track_map.png` no backend e apontar `trackMapSource` para essa URL.
+
+Comandos:
+
+```bash
+python3 src/getTrajetoria.py data/processed/candump-* --lap-period-sec 45 --bias-yaw-bordas-sec 3
+python3 src/exportMapaFrontend.py
+python3 src/plotador.py
+```
+
+Ou pelo orquestrador:
+
+```bash
+python3 src/runPipeline.py --skip-extract --export-track-frontend --lap-period-sec 45 --bias-yaw-bordas-sec 3
+```
+
+### Motivos de falha para “sem mapa base” (resumo operacional)
+
+- `pico_autocorr_fraco`: periodicidade de velocidade fraca para inferir volta automaticamente.
+- `duracao_ou_fs_insuficiente`: grade comum curta para detectar período.
+- `duracao_curta_para_multiplas_voltas`: mesmo com período fixo, janela útil não atende regra de tracking.
+
+### Critério de validação para integração frontend
+
+- Sessão deve conter `MAPA_BASE_X/Y` (ou fallback explícito aceito em operação).
+- `frontend/track_map.png` deve existir e abrir corretamente no cockpit.
+- `track_timeline.json` deve conter `track.points` e `timeline.vehicle.{x,y}` para futura animação de posição sobre o mapa.
+
+---
+
+## Modularização da regra de negócio do mapa
+
+Para preparar integração em tempo real, a regra foi separada em módulos:
+
+- `src/getVelocidade.py`: velocidade por integração da aceleração, com corte automático de parado (janela de movimento) por padrão.
+- `src/mapaRegraNegocio.py`: regra central do mapa:
+  1. estimar período de volta (`estimar_periodo_volta_segundos`);
+  2. congelar 1ª volta em `MAPA_BASE`;
+  3. rastrear posição no mapa por progresso escalar.
+- `src/getTrajetoria.py`: integração IMU/RPM + uso explícito do `mapaRegraNegocio`.
+- `src/exportMapaFrontend.py`: exporta `frontend/track_map.png` e `frontend/track_timeline.json`.
+- `src/runPipelineMapa.py`: pipeline dedicada a essa regra (velocidade → trajetória/mapa → export frontend).
+
+### Processo validado (pré-integração realtime)
+
+1. Extrair/corrigir velocidade de `ACC` com corte de parado:
+   - padrão do `getVelocidade.py` (sem `--sem-janela-movimento`).
+2. Gerar trajetória e mapa base:
+   - `getTrajetoria.py` com `--lap-period-sec` quando auto-detecção falhar.
+3. Confirmar artefatos:
+   - `TRAJETORIA_X/Y.csv`
+   - `MAPA_BASE_X/Y.csv` (quando sessão válida para mapa)
+   - `frontend/track_map.png`
+   - `frontend/track_timeline.json`
+
+### Comando único da pipeline de negócio do mapa
+
+```bash
+python3 src/runPipelineMapa.py --lap-period-sec 45 --bias-yaw-bordas-sec 3
+```
+
+### Critério de pronto para integração
+
+- Velocidade integrada sem trecho de repouso contaminando início/fim (janela de movimento coerente no log).
+- Mapa base gerado a partir da 1ª volta para sessões com duração/sobreposição adequadas.
+- Tracking projetando posição no mapa fixo (sem redesenhar pista a cada volta).
+- Export frontend disponível por sessão para acoplar no backend em tempo real.
+
+---
+
 ## Pendências
 
 | Pendência | Descrição | Bloqueia |

@@ -114,7 +114,7 @@ import pandas as pd
 from pathlib import Path
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d
-from mapa_bundle.mapaRegraNegocio import (
+from mapaRegraNegocio import (
     N_RESAMPLE_MAPA,
     estimar_periodo_volta_segundos,
     rastrear_no_mapa_primeira_volta,

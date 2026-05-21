@@ -296,7 +296,8 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    if mapa_x is not None and mapa_y is not None:
+    usar_apenas_primeira_volta = mapa_x is not None and mapa_y is not None
+    if usar_apenas_primeira_volta:
         n_mapa = min(len(mapa_x), len(mapa_y))
         mapa_x = mapa_x[:n_mapa]
         mapa_y = mapa_y[:n_mapa]
@@ -304,35 +305,41 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
             mapa_x,
             mapa_y,
             color="#f2cc60",
-            linewidth=2.2,
-            alpha=0.85,
+            linewidth=2.6,
+            alpha=0.92,
             label="Mapa base (1ª volta)",
-            zorder=2,
+            zorder=3,
         )
+        x_plot, y_plot = mapa_x, mapa_y
+        erro_plot = ((x_plot[-1] - x_plot[0])**2 + (y_plot[-1] - y_plot[0])**2) ** 0.5
+        n_plot = len(x_plot)
+    else:
+        # Linha da trajetória com gradiente de alpha simulado por segmentos
+        n_segmentos = min(n - 1, 500)
+        indices     = [int(i * (n - 1) / n_segmentos) for i in range(n_segmentos + 1)]
+        for i in range(len(indices) - 1):
+            i0, i1   = indices[i], indices[i + 1]
+            alpha    = 0.3 + 0.7 * (i / n_segmentos)   # mais opaco no final
+            ax.plot(x[i0:i1 + 1], y[i0:i1 + 1], color=cor_traj, linewidth=1.5, alpha=alpha)
+        x_plot, y_plot = x, y
+        erro_plot = erro_fechamento
+        n_plot = n
 
-    # Linha da trajetória com gradiente de alpha simulado por segmentos
-    n_segmentos = min(n - 1, 500)
-    indices     = [int(i * (n - 1) / n_segmentos) for i in range(n_segmentos + 1)]
-    for i in range(len(indices) - 1):
-        i0, i1   = indices[i], indices[i + 1]
-        alpha    = 0.3 + 0.7 * (i / n_segmentos)   # mais opaco no final
-        ax.plot(x[i0:i1 + 1], y[i0:i1 + 1], color=cor_traj, linewidth=1.5, alpha=alpha)
-
-    # Marcadores de início e fim
-    ax.plot(x[0],  y[0],  marker="^", markersize=10, color="#56d364", label="Início",
+    # Marcadores de início e fim (da curva exibida)
+    ax.plot(x_plot[0],  y_plot[0],  marker="^", markersize=10, color="#56d364", label="Início",
             zorder=5, linestyle="None")
-    ax.plot(x[-1], y[-1], marker="s", markersize=9,  color="#f78166", label="Fim",
+    ax.plot(x_plot[-1], y_plot[-1], marker="s", markersize=9,  color="#f78166", label="Fim",
             zorder=5, linestyle="None")
 
-    # Linha tracejada do erro de fechamento
-    ax.plot([x[-1], x[0]], [y[-1], y[0]], color="#f78166", linewidth=0.8,
-            linestyle="--", alpha=0.6, label=f"Erro fechamento: {erro_fechamento:.2f} m")
+    # Linha tracejada do erro de fechamento da curva exibida
+    ax.plot([x_plot[-1], x_plot[0]], [y_plot[-1], y_plot[0]], color="#f78166", linewidth=0.8,
+            linestyle="--", alpha=0.6, label=f"Erro fechamento: {erro_plot:.2f} m")
 
     # Detecta trajetória degenerada (linha reta ou extensão mínima).
     # Limiar: se lado menor / lado maior < 10%, aplica padding para evitar
     # gráfico achatado ilegível quando set_aspect("equal") é usado.
-    x_range   = x.max() - x.min() if x.max() != x.min() else 1.0
-    y_range   = y.max() - y.min() if y.max() != y.min() else 1.0
+    x_range   = x_plot.max() - x_plot.min() if x_plot.max() != x_plot.min() else 1.0
+    y_range   = y_plot.max() - y_plot.min() if y_plot.max() != y_plot.min() else 1.0
     lado_max  = max(x_range, y_range)
     lado_min  = min(x_range, y_range)
     degenerada = (lado_min / lado_max) < 0.10
@@ -341,8 +348,8 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
     if degenerada:
         titulo += "  ⚠ trajetória aproximadamente reta"
         pad_geo = lado_max * 0.20
-        cx = (x.max() + x.min()) / 2
-        cy = (y.max() + y.min()) / 2
+        cx = (x_plot.max() + x_plot.min()) / 2
+        cy = (y_plot.max() + y_plot.min()) / 2
         ax.set_xlim(cx - lado_max / 2 - pad_geo, cx + lado_max / 2 + pad_geo)
         ax.set_ylim(cy - lado_max / 2 - pad_geo, cy + lado_max / 2 + pad_geo)
 
@@ -357,11 +364,13 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
 
     # Estatísticas no canto
     stats = (
-        f"n={n}  |  {duracao:.1f}s\n"
-        f"X: [{x.min():.1f}, {x.max():.1f}] m\n"
-        f"Y: [{y.min():.1f}, {y.max():.1f}] m\n"
-        f"Erro fechamento: {erro_fechamento:.2f} m"
+        f"n={n_plot}  |  {duracao:.1f}s\n"
+        f"X: [{x_plot.min():.1f}, {x_plot.max():.1f}] m\n"
+        f"Y: [{y_plot.min():.1f}, {y_plot.max():.1f}] m\n"
+        f"Erro fechamento: {erro_plot:.2f} m"
     )
+    if usar_apenas_primeira_volta:
+        stats += "\nExibindo: mapa base (1ª volta)"
     ax.text(0.99, 0.02, stats, transform=ax.transAxes, fontsize=6.5,
             va="bottom", ha="right", color=COR_TEXTO_SUAVE,
             bbox=dict(boxstyle="round,pad=0.4", facecolor=COR_FUNDO_FIGURA,
