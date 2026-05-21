@@ -195,7 +195,11 @@ def detectar_janela_movimento(
 
 # ── Pipeline de integração ────────────────────────────────────────────────────
 
-def processar_csv_aceleracao(caminho_csv: Path) -> None:
+def processar_csv_aceleracao(
+    caminho_csv: Path,
+    sem_janela_movimento: bool = False,
+    sem_rampa_drift: bool = False,
+) -> None:
     """
     Executa o pipeline completo de integração para um arquivo de aceleração.
 
@@ -203,9 +207,11 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
       1. Carrega e valida o CSV.
       2. Estima e remove o bias estático do sensor.
       3. Aplica filtro Butterworth passa-baixa (4ª ordem, 3 Hz).
-      4. Detecta e corta a janela de movimento (descarta repouso inicial e final).
+      4. Detecta e corta a janela de movimento (descarta repouso inicial e final),
+         salvo se ``sem_janela_movimento`` (útil quando o ACC já foi cortado à mão).
       5. Integra por método trapezoidal com timestamps reais.
-      6. Remove drift linear residual.
+      6. Remove drift linear residual (rampa), salvo se ``sem_rampa_drift``
+         (p.ex. trecho aberto ou corte manual já alinhado).
       7. Salva o CSV de velocidade.
     """
     print(f"\n[velo] {caminho_csv.name}")
@@ -259,18 +265,17 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
     print(f"  Fs detectada     : {taxa_amostragem:.2f} Hz  |  Cutoff filtro: {cutoff_hz} Hz")
 
     # ── Etapa 4: Detecção e corte da janela de movimento ─────────────────────
-    # Descarta amostras de repouso no início e no fim: onde a aceleração filtrada
-    # fica próxima de zero de forma sustentada, o carro está parado e integrar
-    # esse trecho só acumularia erro.
-    inicio_idx, fim_idx = detectar_janela_movimento(df["acc_filtrada"].to_numpy())
-
-    n_total  = len(df)
-    n_janela = fim_idx - inicio_idx
-    t_inicio = df["timestamp"].iloc[inicio_idx]
-    t_fim    = df["timestamp"].iloc[fim_idx - 1]
-    print(f"  Janela movimento : {t_inicio:.2f}s → {t_fim:.2f}s  [{n_janela}/{n_total} amostras]")
-
-    df = df.iloc[inicio_idx:fim_idx].reset_index(drop=True)
+    n_total = len(df)
+    if sem_janela_movimento:
+        print("  Janela movimento : [flag] --sem-janela-movimento — usa todo o trecho do CSV (sem recorte automático).")
+        inicio_idx, fim_idx = 0, n_total
+    else:
+        inicio_idx, fim_idx = detectar_janela_movimento(df["acc_filtrada"].to_numpy())
+        n_janela = fim_idx - inicio_idx
+        t_inicio = df["timestamp"].iloc[inicio_idx]
+        t_fim    = df["timestamp"].iloc[fim_idx - 1]
+        print(f"  Janela movimento : {t_inicio:.2f}s → {t_fim:.2f}s  [{n_janela}/{n_total} amostras]")
+        df = df.iloc[inicio_idx:fim_idx].reset_index(drop=True)
 
     # ── Etapa 5: Integração trapezoidal ──────────────────────────────────────
     # Usa timestamps reais para lidar corretamente com taxas de amostragem
@@ -284,13 +289,13 @@ def processar_csv_aceleracao(caminho_csv: Path) -> None:
     df["velocidade"] = velocidade
 
     # ── Etapa 6: Remoção de drift linear residual ─────────────────────────────
-    # Qualquer drift residual manifesta-se como uma tendência linear na velocidade.
-    # Assume que a velocidade líquida ao final da sessão deve ser ~0
-    # (válido para pista fechada ou teste de bancada).
-    # Subtrai uma rampa linear proporcional ao valor final de velocidade.
-    rampa_drift      = np.linspace(0, df["velocidade"].iloc[-1], len(df))
-    df["velocidade"] = df["velocidade"] - rampa_drift
-    df["velocidade"] = df["velocidade"] - df["velocidade"].iloc[0]  # ancora em zero
+    if sem_rampa_drift:
+        print("  Rampa drift      : [flag] --sem-rampa-drift — não aplica rampa linear (só ancora v(0)=0).")
+        df["velocidade"] = df["velocidade"] - df["velocidade"].iloc[0]
+    else:
+        rampa_drift      = np.linspace(0, df["velocidade"].iloc[-1], len(df))
+        df["velocidade"] = df["velocidade"] - rampa_drift
+        df["velocidade"] = df["velocidade"] - df["velocidade"].iloc[0]  # ancora em zero
 
     print(f"  Velocidade final : {df['velocidade'].iloc[-1]:.4f} m/s")
 
@@ -315,16 +320,23 @@ def main():
     print("  INTEGRADOR DE VELOCIDADE — IMU")
     print("=" * 60)
 
-    if len(sys.argv) < 2:
-        print("\nUso: python3 getVelocidade.py <caminho/para/SINAL_ACC.csv> [...]")
+    raw = sys.argv[1:]
+    sem_janela = "--sem-janela-movimento" in raw
+    sem_rampa  = "--sem-rampa-drift" in raw
+    arquivos   = [a for a in raw if not a.startswith("--")]
+
+    if not arquivos:
+        print("\nUso: python3 getVelocidade.py <SINAL_ACC.csv> [...] [flags]")
         print("\nExemplos:")
         print("  python3 src/getVelocidade.py data/processed/candump-1999-12-31/VENTOR_LINEAR_ACC_Y.csv")
         print("  python3 src/getVelocidade.py data/processed/candump-xyz/VENTOR_LINEAR_ACC_*.csv")
+        print("\nFlags (quando o ACC já foi cortado manualmente ou a rampa distorce a sessão):")
+        print("  --sem-janela-movimento  Não recorta repouso início/fim (usa todo o CSV).")
+        print("  --sem-rampa-drift       Não subtrai rampa linear até v_final=0.")
         print("\nO arquivo de saída é salvo no mesmo diretório do arquivo de entrada.")
         return
 
-    # Aceita múltiplos argumentos e padrões glob (expandidos pelo shell ou pelo script)
-    for argumento in sys.argv[1:]:
+    for argumento in arquivos:
         caminho = Path(argumento)
         lista_arquivos = [caminho] if caminho.exists() else sorted(Path().glob(argumento))
 
@@ -332,7 +344,11 @@ def main():
             if not caminho_arquivo.exists():
                 print(f"\n[ERRO] Arquivo não encontrado: {caminho_arquivo}")
                 continue
-            processar_csv_aceleracao(caminho_arquivo)
+            processar_csv_aceleracao(
+                caminho_arquivo,
+                sem_janela_movimento=sem_janela,
+                sem_rampa_drift=sem_rampa,
+            )
 
     print("\nPronto.\n")
 

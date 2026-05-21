@@ -12,24 +12,24 @@ Pipeline para reconstruir a trajetória 2D do veículo no plano da pista a parti
   - [Abordagem adotada — Dead Reckoning](#abordagem-adotada--dead-reckoning)
     - [Obtenção da velocidade angular](#obtenção-da-velocidade-angular)
     - [Fluxo de processamento](#fluxo-de-processamento)
+    - [Regra de negócio — mapa base e tracking](#regra-de-negócio--mapa-base-e-tracking)
     - [Hipóteses assumidas](#hipóteses-assumidas)
     - [Riscos e mitigações](#riscos-e-mitigações)
+  - [Fusão IMU + RPM e parâmetros de execução](#fusão-imu--rpm-e-parâmetros-de-execução)
+    - [Estimativas por odometria diferencial](#estimativas-por-odometria-diferencial)
+    - [Filtro de fusão atual — complementar](#filtro-de-fusão-atual--complementar)
+    - [Filtro de fusão futuro — EKF](#filtro-de-fusão-futuro--ekf)
+    - [Progressão técnica](#progressão-técnica)
   - [Resultados empíricos e diagnóstico de erros](#resultados-empíricos-e-diagnóstico-de-erros)
     - [Padrão observado](#padrão-observado)
     - [Causas identificadas](#causas-identificadas)
     - [Evidências visuais](#evidências-visuais)
-  - [Abordagem futura — Fusão IMU + RPM](#abordagem-futura--fusão-imu--rpm)
-    - [Estimativas por odometria diferencial](#estimativas-por-odometria-diferencial)
-    - [Filtro de fusão — EKF](#filtro-de-fusão--ekf)
-    - [Progressão técnica](#progressão-técnica)
-    - [Por que está bloqueada hoje](#por-que-está-bloqueada-hoje)
+  - [Inspeção geral (dados atuais) e melhorias recentes](#inspeção-geral-dados-atuais-e-melhorias-recentes)
   - [Pendências](#pendências)
-
----
 
 ## Contexto
 
-A IMU embarcada fornece aceleração linear (`ACC_X`, `ACC_Y`) e velocidade angular (`ANG_VEL_Z`). Os inversores de tração fornecem RPM de cada motor (`ACT_SPEED_A13`, `ACT_SPEED_B13`). O objetivo é combinar esses sinais para estimar posição `x, y` ao longo do tempo.
+A IMU embarcada fornece aceleração linear (`ACC_X`, `ACC_Y`, `ACC_Z`) e velocidade angular (`ANG_VEL_Z`). No padrão FSAE adotado aqui, `ACC_X` é a aceleração longitudinal do carro e `ACC_Z` é positivo para baixo. Os inversores de tração fornecem RPM de cada motor (`ACT_SPEED_A13`, `ACT_SPEED_B13`). O objetivo é combinar esses sinais para estimar posição `x, y` ao longo do tempo.
 
 O problema central é que a IMU vive no **body frame** do carro — seus eixos estão colados ao chassi e giram com ele. A trajetória precisa estar no **world frame** — coordenadas fixas no chão. A velocidade angular é a chave que converte um referencial no outro a cada instante: ela acumula o ângulo de rotação do veículo (heading), que permite projetar o movimento do body frame para o world frame.
 
@@ -37,54 +37,125 @@ O problema central é que a IMU vive no **body frame** do carro — seus eixos e
 
 ## Abordagem adotada — Dead Reckoning
 
-Combina a velocidade escalar longitudinal (já obtida pela integração de `ACC_Y`) com o heading acumulado a partir de `VENTOR_ANGULAR_SPEED_Z` para reconstruir a trajetória 2D.
+Combina a velocidade escalar longitudinal estimada por `RPM + ACC_X` com o heading acumulado a partir de `VENTOR_ANGULAR_SPEED_Z` para reconstruir a trajetória 2D.
 
 ### Obtenção da velocidade angular
 
 `VENTOR_ANGULAR_SPEED_Z` é lido **diretamente do sensor** (giroscópio) via barramento candump — CAN ID `0x00000002`, bytes 2–3, int16, fator `× 0.01 rad/s`. O sinal já está mapeado em `SINAIS_CANDUMP` e é extraído por `extratorCandumpFiles.py`.
 
-A opção de derivar `ω = ACC_X / VEL_Y` fica descartada como abordagem primária. Pode ser mantida como validação cruzada: se o yaw rate derivado diferir sistematicamente do sensor, pode indicar erro de calibração ou montagem da IMU.
+A opção de derivar `ω` pela relação entre aceleração lateral e velocidade longitudinal fica descartada como abordagem primária. Pode ser mantida como validação cruzada: se o yaw rate derivado diferir sistematicamente do sensor, pode indicar erro de calibração ou montagem da IMU.
 
 > **Pendência de convenção de sinal:** o sentido positivo de `VENTOR_ANGULAR_SPEED_Z` (horário ou anti-horário visto de cima) ainda não foi confirmado empiricamente. Ver seção [Pendências](#pendências).
 
 ### Fluxo de processamento
 
 ```
-ACC_Y  ──►  getVelocidade.py  ──►  VENTOR_LINEAR_VEL_Y (m/s)  ────────────────────────────────►  vx = vel · cos(θ)  ──►  x[i] = x[i-1] + vx · Δt
-                                                                                                                      ►  vy = vel · sin(θ)  ──►  y[i] = y[i-1] + vy · Δt
+ACT_SPEED_A13/B13 ──► rpm / 11,72 ──► rps_roda × circunferência ──┐
+                                                                  ├──► velocidade longitudinal ──► vx = vel · cos(θ) ──► x,y (bruto)
+ACC_X ───────────────────────────────► predição de transientes ───┘                              └──► vy = vel · sin(θ) ──►
 VENTOR_ANGULAR_SPEED_Z (sensor)  ──►  getTrajetoria.py  ──►  θ[i] = θ[i-1] + 0.5·(ω[i]+ω[i-1])·Δt  ────────────►
+                                                                                         x,y (bruto) ──► mapa base + tracking ──► x,y (CSV)
 ```
 
 Etapas do módulo `getTrajetoria.py`:
 
-1. Carregar `VENTOR_LINEAR_VEL_Y.csv` e `VENTOR_ANGULAR_SPEED_Z.csv` do mesmo diretório de sessão.
+1. Carregar `ACT_SPEED_A13.csv`/`ACT_SPEED_B13.csv`, `VENTOR_LINEAR_ACC_X.csv` e `VENTOR_ANGULAR_SPEED_Z.csv` do mesmo diretório de sessão.
 2. Corrigir bias de `VENTOR_ANGULAR_SPEED_Z` pelo mesmo método do `getVelocidade.py` (percentil 5%).
 3. Aplicar filtro Butterworth passa-baixa (4ª ordem, 2 Hz) para remover ruído antes de integrar.
-4. Interpolar `VENTOR_ANGULAR_SPEED_Z` nos timestamps de `VENTOR_LINEAR_VEL_Y` (os dois sinais têm timestamps independentes).
+4. Converter RPM de motor em velocidade linear de roda e fundir com `ACC_X` por filtro complementar.
 5. Integrar `VENTOR_ANGULAR_SPEED_Z` → heading `θ` por método trapezoidal com timestamps reais.
-6. Decompor `VENTOR_LINEAR_VEL_Y` em componentes world frame usando `θ`.
-7. Integrar `vx`, `vy` → posição `x`, `y` por método trapezoidal.
-8. Reportar erro de fechamento como métrica de qualidade da sessão.
-9. Salvar `TRAJETORIA_X.csv` e `TRAJETORIA_Y.csv` no formato padrão da pipeline.
+6. Decompor a velocidade longitudinal fundida em componentes world frame usando `θ`.
+7. Integrar `vx`, `vy` → posição `x`, `y` por método trapezoidal (trajetória bruta contínua).
+8. **Mapa base + tracking (padrão):** estimar duração típica de volta pela autocorrelação da velocidade fundida (ou usar `--lap-period-sec`); tratar a primeira volta como mapa fixo (`MAPA_BASE_X/Y`); depois disso, não gerar novas geometrias de pista, apenas projetar a posição do carro nesse mapa por progresso de distância. Desligar com `--no-track-map` (`--no-mini-slam` segue como alias legado).
+9. Reportar erro de fechamento como métrica de qualidade da sessão.
+10. Salvar `TRAJETORIA_X.csv` e `TRAJETORIA_Y.csv` no formato padrão da pipeline.
+
+### Regra de negócio — mapa base e tracking
+
+A regra correta do produto é: **mapa não é uma estimativa iterativa infinita da pista**. O primeiro objetivo é gerar um mapa base plausível na primeira volta completa. A partir daí, a tarefa muda: o sistema deve **trackear a posição do veículo dentro desse mapa**, não redesenhar a pista volta após volta.
+
+Na implementação, a primeira volta é congelada como `MAPA_BASE_X.csv` e `MAPA_BASE_Y.csv`. O restante da sessão usa a distância acumulada pela velocidade fundida (`RPM + ACC_X`) para calcular o progresso do carro na volta e projetar o ponto correspondente sobre a polilinha fixa do mapa. Assim as distorções de uma volta posterior não viram uma pista nova e não contaminam o mapa. O CSV `TRAJETORIA_X/Y` passa a representar a posição rastreada no mapa base quando o tracking está ativo; o `plotador.py` sobrepõe o mapa base em amarelo no gráfico `TRAJETORIA_2D.png`.
+
+**Estimativa de período:** autocorrelação da série de velocidade (centrada na média); primeiro máximo relevante acima de ~12 s e abaixo de ~360 s; exige duração da sessão ≥ ~1,28× o período detectado para tentar duas voltas. Se a detecção falhar (pista irregular, SC, poucas voltas), informe o período manualmente: `--lap-period-sec 52.5` ou `--lap-period-sec=52.5`. A `runPipeline.py` repassa essas flags ao `getTrajetoria.py`.
+
+**Limitações:** se a primeira volta estiver ruim, o mapa base ficará ruim; o tracking só impede que as voltas seguintes deformem ainda mais a pista. Voltas com tempos muito diferentes, bandeiras, pit ou recorte que corta no meio da volta degradam a estimativa de progresso. O fechamento da primeira volta continua sendo uma métrica importante de qualidade do mapa base.
 
 ### Hipóteses assumidas
 
 - `θ₀ = 0`: heading inicial arbitrário (norte local do sistema de coordenadas).
-- `vel(t₀) = 0`: carro parado no início da janela de movimento (herdado do `getVelocidade.py`).
+- A velocidade longitudinal vem do RPM como grandeza escalar; o sinal dos motores é tratado em módulo para evitar cancelamento quando a montagem elétrica usa sinais opostos entre lados.
 - Trajetória aproximadamente fechada para interpretação do drift — válido para pista de testes.
 - `VENTOR_ANGULAR_SPEED_Z` mede rotação em torno do eixo Z (vertical), confirmado pela especificação da IMU.
 
 ### Riscos e mitigações
 
-**Drift de posição acumulado** — inevitável em dead reckoning puro. O erro cresce com o tempo e fica visível quando o ponto final não coincide com o inicial no mapa. Mitigação imediata: reportar o erro de fechamento como métrica. Mitigação futura: fusão com GPS.
+**Drift de posição acumulado** — inevitável em dead reckoning puro. O erro cresce com o tempo e fica visível quando o ponto final não coincide com o inicial no mapa. Mitigações: reportar o erro de fechamento; fusão RPM + `ACC_X`; mapa base da primeira volta + tracking de posição; futuro: fusão com GPS.
 
 **Bias de `VENTOR_ANGULAR_SPEED_Z`** — offsets estáticos do giroscópio se acumulam no heading e distorcem toda a trajetória. Mitigação: correção de percentil 5% antes de integrar. **Limitação conhecida:** se a sessão começa já em movimento, o percentil 5% captura amostras de curva suave em vez de repouso real e subestima o bias. Ver causas identificadas abaixo.
 
 **Convenção de sinal do yaw** — se o sentido positivo estiver invertido, a trajetória será espelhada. Mitigação: flag `--negar-yaw` no `getTrajetoria.py`.
 
-**Dessincronização de timestamps** — `VENTOR_ANGULAR_SPEED_Z` e `VENTOR_LINEAR_VEL_Y` têm timestamps independentes. Mitigação: interpolação linear antes da integração conjunta.
+**Dessincronização de timestamps** — RPM, `VENTOR_LINEAR_ACC_X` e `VENTOR_ANGULAR_SPEED_Z` têm timestamps independentes. Mitigação: interpolação linear antes da integração conjunta.
 
 **Remoção de drift linear da velocidade** — `getVelocidade.py` subtrai uma rampa linear assumindo velocidade final ~0. Se a sessão não termina com o carro parado, essa correção introduz uma velocidade residual artificial que se integra em erro de posição.
+
+---
+
+## Fusão IMU + RPM e parâmetros de execução
+
+**Convenção FSAE (telemetria deste repositório):** `VENTOR_LINEAR_ACC_X` é aceleração longitudinal; `ACC_Z` é positivo para baixo. **RPM dos inversores** está considerado válido e ancora a escala de velocidade.
+
+**Conversão motor → velocidade linear da roda** (constantes em `getTrajetoria.py`):
+
+```
+rpm_roda   = rpm_motor / 11,72        # redução planetária
+rps_roda   = rpm_roda / 60
+circunf    = 2π × raio_roda
+raio_roda  = 10 pol × 0,0254 m/pol = 0,254 m
+vel_m/s    = rps_roda × circunf      # equivalente a |rpm_motor| × (circunf / (60 × 11,72))
+```
+
+Implementação NumPy: `RPM_MOTOR_PARA_MPS = CIRCUNFERENCIA_RODA_M / (60.0 * FATOR_REDUCAO_PLANETARIA)`. Com dois motores, interpola-se cada lado na grade temporal mais densa e usa-se a média das velocidades derivadas antes da fusão com `ACC_X`.
+
+**Fusão velocidade (filtro complementar):** a cada passo, a velocidade predita pela integração de `ACC_X` é misturada com a velocidade a partir do RPM (`PESO_CORRECAO_RPM`, padrão 0,35) para manter transientes da IMU sem deriva livre de escala entre trechos longos.
+
+O padrão adotado por equipes europeias de Formula SAE competitivas é a fusão de IMU com encoders de roda — no contexto deste projeto, os RPMs dos inversores. As duas fontes se complementam nos seus pontos cegos:
+
+- **IMU sozinha** deriva — erros de bias e ruído se acumulam nas integrações e o drift cresce com o tempo.
+- **RPM sozinho** mente em transientes — em aceleração forte, frenagem brusca e curvas com escorregamento o pneu patina e o encoder reporta uma velocidade que não corresponde ao deslocamento real.
+
+### Estimativas por odometria diferencial
+
+Com RPM confiável, a diferença de velocidade entre `ACT_SPEED_A13` e `ACT_SPEED_B13` fornece diretamente velocidade escalar e yaw rate por geometria diferencial:
+
+```
+vel = (RPM_A + RPM_B) / 2 · fator_conversão
+ω   = (RPM_A - RPM_B) / distância_entre_eixos
+```
+
+### Filtro de fusão atual — complementar
+
+A implementação atual usa um filtro complementar simples em `getTrajetoria.py`: `ACC_X` prevê transientes entre frames e o RPM corrige continuamente a escala de velocidade. A camada de **mapa base + tracking** trata a regra de negócio no plano `x,y`: primeira volta define o mapa; voltas seguintes só atualizam a posição sobre ele.
+
+### Filtro de fusão futuro — EKF
+
+A fusão é feita por um **Filtro de Kalman Estendido (EKF)**, que combina as duas fontes com pesos dinâmicos baseados na covariância estimada de cada sinal. Quando o RPM está confiável o filtro aumenta seu peso; quando detecta inconsistência (escorregamento), aumenta o peso da IMU. O ângulo de esterço como terceiro sinal permite um modelo cinemático completo.
+
+### Progressão técnica
+
+```
+[agora]   Dead reckoning  →  IMU only, valida pipeline e sinais individualmente
+             ↓
+[próximo] Correção bias giroscópio  →  estimar bias só nos trechos de repouso real
+             ↓
+[próximo] Correção drift velocidade →  não aplicar rampa quando sessão não termina em repouso
+             ↓
+[agora]   Fusão complementar  →  RPM ancora velocidade, ACC_X modela transientes
+             ↓
+[agora]   Mapa base + tracking  →  primeira volta vira pista; depois só rastreia posição nela
+             ↓
+[futuro]  EKF  →  fusão IMU + RPM (+ ângulo de esterço)  →  padrão competitivo SAE
+```
 
 ---
 
@@ -129,43 +200,36 @@ Sessões curtas em linha reta produzem trajetórias com proporção de aspecto e
 
 ---
 
-## Abordagem futura — Fusão IMU + RPM
+## Inspeção geral (dados atuais) e melhorias recentes
 
-O padrão adotado por equipes europeias de Formula SAE competitivas é a fusão de IMU com encoders de roda — no contexto deste projeto, os RPMs dos inversores. A razão é que as duas fontes se complementam nos seus pontos cegos:
+**Constatação:** em `data/processed/` **não há** `ACT_SPEED_A13/B13.csv` — toda a trajetória cai no **fallback** `VENTOR_LINEAR_VEL_*` (integração do ACC). Sem RPM, não há fusão que ancore a escala longitudinal; qualquer erro do integrador de velocidade ou do gyro pesa direto no `x,y`.
 
-- **IMU sozinha** deriva — erros de bias e ruído se acumulam nas integrações e o drift cresce com o tempo.
-- **RPM sozinho** mente em transientes — em aceleração forte, frenagem brusca e curvas com escorregamento o pneu patina e o encoder reporta uma velocidade que não corresponde ao deslocamento real.
+**Conflito com corte manual do ACC:** o `getVelocidade.py` ainda aplicava (1) **segundo corte** por “janela de movimento” e (2) **rampa** que força `v_final ≈ 0`. Se já recortaste o ACC à mão, isso pode **encolher de mais** o trecho ou **distorcer** a escala de velocidade.
 
-### Estimativas por odometria diferencial
+**Flags adicionadas (sem precisar de extrator):**
 
-Com RPM confiável, a diferença de velocidade entre `ACT_SPEED_A13` e `ACT_SPEED_B13` fornece diretamente velocidade escalar e yaw rate por geometria diferencial:
+| Flag | Script | Efeito |
+|------|--------|--------|
+| `--sem-janela-movimento` | `getVelocidade.py` | Integra **todo** o CSV de ACC (não recorta repouso auto). |
+| `--sem-rampa-drift` | `getVelocidade.py` | **Não** aplica rampa linear até zero no fim; só ancora `v(0)=0`. |
+| `--bias-yaw-bordas-sec S` | `getTrajetoria.py` | Bias do gyro = média nos **primeiros e últimos S s** (útil com parado nas pontas). |
+| `--no-track-map` | `getTrajetoria.py` | Desativa o tracking no mapa da primeira volta e salva a trajetória bruta contínua. |
 
-```
-vel = (RPM_A + RPM_B) / 2 · fator_conversão
-ω   = (RPM_A - RPM_B) / distância_entre_eixos
-```
+A `runPipeline.py` **repassa** essas flags quando presentes em `sys.argv`.
 
-### Filtro de fusão — EKF
+**Fluxo recomendado** (preserva o teu corte de ACC; não roda extratores):
 
-A fusão é feita por um **Filtro de Kalman Estendido (EKF)**, que combina as duas fontes com pesos dinâmicos baseados na covariância estimada de cada sinal. Quando o RPM está confiável o filtro aumenta seu peso; quando detecta inconsistência (escorregamento), aumenta o peso da IMU. O ângulo de esterço como terceiro sinal permite um modelo cinemático completo.
-
-### Progressão técnica
-
-```
-[agora]   Dead reckoning  →  IMU only, valida pipeline e sinais individualmente
-             ↓
-[próximo] Correção bias giroscópio  →  estimar bias só nos trechos de repouso real
-             ↓
-[próximo] Correção drift velocidade →  não aplicar rampa quando sessão não termina em repouso
-             ↓
-[futuro]  Correção firmware inversores  →  RPM confiável em operação
-             ↓
-[futuro]  EKF  →  fusão IMU + RPM (+ ângulo de esterço)  →  padrão competitivo SAE
+```bash
+./.venv/bin/python src/getVelocidade.py data/processed/**/VENTOR_LINEAR_ACC_*.csv \
+  --sem-janela-movimento --sem-rampa-drift
+./.venv/bin/python src/getTrajetoria.py data/processed/candump-*/ \
+  --bias-yaw-bordas-sec 3
+./.venv/bin/python src/plotador.py
 ```
 
-### Por que está bloqueada hoje
+(Ajusta `S` em função de quantos segundos de parado tens no início/fim; se não houver repouso real, mantém o bias por percentil omitindo esta flag.)
 
-Os bytes `b[1:3]` dos inversores apresentam saltos de ~16.000 rpm entre frames consecutivos durante operação sob carga. O firmware grava dados de diagnóstico nesses bytes nessa condição. A taxa de rejeição supera 20%, gerando arquivos `.invalid`. Requer revisão com o fornecedor do inversor.
+**Outras alternativas de médio prazo:** gerar `ACT_SPEED_*.csv` a partir dos logs de sessão (extrator só de inversores, se existir fonte separada); EKF; GPS ou marcação explícita de voltas; validar escala do CAN do gyro em sessões com `yaw_max` suspeitamente baixo (~0,01 rad/s).
 
 ---
 
@@ -174,8 +238,7 @@ Os bytes `b[1:3]` dos inversores apresentam saltos de ~16.000 rpm entre frames c
 | Pendência | Descrição | Bloqueia |
 |---|---|---|
 | Convenção de sinal do yaw | Confirmar sentido positivo de `VENTOR_ANGULAR_SPEED_Z`. Fazer uma curva à direita em baixa velocidade e verificar se o sinal resultante é positivo ou negativo. Registrar aqui e corrigir em `getTrajetoria.py` se necessário. | Qualidade do mapa — trajetória pode estar espelhada |
-| Estimativa de bias com repouso real | Modificar `getTrajetoria.py` para estimar o bias do giroscópio apenas nos primeiros e últimos N segundos, em vez do percentil global que falha quando a sessão começa em movimento. | Erro sistemático de heading — causa principal do drift em sessões longas |
-| Validação da remoção de drift de velocidade | Modificar `getVelocidade.py` para verificar se a velocidade está próxima de zero no início e fim da janela antes de aplicar a rampa de drift. Emitir aviso quando a hipótese não for satisfeita. | Erro sistemático de posição em sessões cortadas no meio do movimento |
+| Estimativa de bias com repouso real | Opcional: `--bias-yaw-bordas-sec S` no `getTrajetoria.py`. Pendente automatizar escolha de S ou detetar repouso. | Erro sistemático de heading em sessões longas |
+| Validação da remoção de drift de velocidade | Opcional: `--sem-rampa-drift` quando a rampa for incorrecta; pendente detetar automaticamente `|v_início|,|v_fim|` pequenos antes de aplicar rampa. | Erro de posição em cortes manuais / trecho aberto |
 | Visualização de trajetória reta | Melhorar o plotador para detectar trajetórias com proporção de aspecto extrema e aplicar padding mínimo nos eixos. | Legibilidade de sessões curtas em linha reta |
-| Correção de firmware RPM | Separar mapeamento de bytes de RPM real e dados de diagnóstico nos inversores A13/B13. | Abordagem futura (EKF) |
 | Distância entre eixos | Medida física necessária para a fórmula de odometria diferencial. | Abordagem futura (EKF) |

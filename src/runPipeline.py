@@ -11,7 +11,7 @@ de telemetria. Ele executa os módulos da pipeline na ordem correta:
     [1] extratorSessionFiles.py  → decodifica session CSVs
     [2] extratorCandumpFiles.py  → decodifica logs candump
     [3] getVelocidade.py         → integra aceleração → velocidade
-    [4] getTrajetoria.py         → integra yaw + velocidade → posição x, y
+    [4] getTrajetoria.py         → funde RPM + ACC_X + yaw → posição x, y
     [5] plotador.py              → gera gráficos de todos os sinais
 
 Cada etapa é executada como subprocesso independente, o que garante
@@ -32,6 +32,24 @@ FLAGS DISPONÍVEIS
                    a trajetória gerada sair espelhada em relação ao esperado
                    (indica que o sentido positivo do giroscópio é invertido
                    em relação à convenção adotada no dead reckoning).
+
+  --no-track-map   Repassa para getTrajetoria.py: não projeta a posição do
+                   veículo no mapa fixo da primeira volta.
+
+  --no-mini-slam   Alias legado de --no-track-map.
+
+  --sem-janela-movimento
+                   Repassa ao getVelocidade.py: não recorta repouso início/fim no ACC
+                   (use quando o CSV de aceleração já foi cortado manualmente).
+
+  --sem-rampa-drift
+                   Repassa ao getVelocidade.py: não aplica rampa linear de drift na
+                   velocidade integrada.
+
+  --bias-yaw-bordas-sec S
+  --bias-yaw-bordas-sec=S
+                   Repassa ao getTrajetoria.py: estima bias do gyro pela média nos
+                   primeiros e últimos S segundos (útil com repouso real nas pontas).
 
 USO
 ---
@@ -96,19 +114,61 @@ def localizar_csvs_de_aceleracao() -> list[Path]:
 
 def localizar_diretorios_de_sessao() -> list[Path]:
     """
-    Busca diretórios de sessão que contenham tanto VENTOR_LINEAR_VEL_Y.csv
-    quanto VENTOR_ANGULAR_SPEED_Z.csv — sinais necessários para getTrajetoria.py.
+    Busca diretórios de sessão com sinais suficientes para getTrajetoria.py.
+
+    Modo preferencial: RPM dos inversores + ACC_X + yaw.
+    Fallback legado: velocidade integrada VEL_X/VEL_Y + yaw.
     """
     if not DIR_PROCESSADO.exists():
         return []
     diretorios = []
     for pasta in sorted(DIR_PROCESSADO.iterdir()):
         if pasta.is_dir():
-            tem_vel = (pasta / "VENTOR_LINEAR_VEL_Y.csv").exists()
+            tem_rpm = (pasta / "ACT_SPEED_A13.csv").exists() or (pasta / "ACT_SPEED_B13.csv").exists()
+            tem_acc_x = (pasta / "VENTOR_LINEAR_ACC_X.csv").exists()
+            tem_vel = (pasta / "VENTOR_LINEAR_VEL_X.csv").exists() or (pasta / "VENTOR_LINEAR_VEL_Y.csv").exists()
             tem_yaw = (pasta / "VENTOR_ANGULAR_SPEED_Z.csv").exists()
-            if tem_vel and tem_yaw:
+            if tem_yaw and ((tem_rpm and tem_acc_x) or tem_vel):
                 diretorios.append(pasta)
     return diretorios
+
+
+def flags_get_velocidade_extras() -> list[str]:
+    """Flags opcionais de sys.argv para getVelocidade (corte manual / rampa)."""
+    out: list[str] = []
+    av = sys.argv[1:]
+    if "--sem-janela-movimento" in av:
+        out.append("--sem-janela-movimento")
+    if "--sem-rampa-drift" in av:
+        out.append("--sem-rampa-drift")
+    return out
+
+
+def flags_get_trajetoria_extras(negar_yaw: bool) -> list[str]:
+    """Flags repassadas de sys.argv para getTrajetoria (mapa/tracking / yaw)."""
+    out: list[str] = []
+    if negar_yaw:
+        out.append("--negar-yaw")
+    av = sys.argv[1:]
+    if "--no-track-map" in av:
+        out.append("--no-track-map")
+    if "--no-mini-slam" in av:
+        out.append("--no-mini-slam")
+    j = 0
+    while j < len(av):
+        item = av[j]
+        if item.startswith("--lap-period-sec="):
+            out.append(item)
+        elif item == "--lap-period-sec" and j + 1 < len(av):
+            out.extend(["--lap-period-sec", av[j + 1]])
+            j += 1
+        elif item.startswith("--bias-yaw-bordas-sec="):
+            out.append(item)
+        elif item == "--bias-yaw-bordas-sec" and j + 1 < len(av):
+            out.extend(["--bias-yaw-bordas-sec", av[j + 1]])
+            j += 1
+        j += 1
+    return out
 
 
 # ── Etapas da pipeline ────────────────────────────────────────────────────────
@@ -144,8 +204,9 @@ def etapa_calcular_velocidade() -> bool:
     for caminho in csvs_aceleracao:
         print(f"  {caminho.relative_to(DIR_BASE)}")
 
+    flags_velo = flags_get_velocidade_extras()
     resultado = subprocess.run(
-        [sys.executable, str(SCRIPT_GET_VELOCIDADE), *[str(p) for p in csvs_aceleracao]],
+        [sys.executable, str(SCRIPT_GET_VELOCIDADE), *[str(p) for p in csvs_aceleracao], *flags_velo],
         cwd=str(DIR_BASE),
     )
     return resultado.returncode == 0
@@ -155,14 +216,14 @@ def etapa_calcular_trajetoria(negar_yaw: bool = False) -> bool:
     """
     Etapa 4: reconstrói a trajetória 2D por dead reckoning.
 
-    Localiza diretórios de sessão que contenham VENTOR_LINEAR_VEL_Y.csv e
-    VENTOR_ANGULAR_SPEED_Z.csv e passa cada um para getTrajetoria.py.
+    Localiza diretórios de sessão com RPM + ACC_X + yaw, ou fallback de
+    velocidade integrada + yaw, e passa cada um para getTrajetoria.py.
     """
     diretorios = localizar_diretorios_de_sessao()
 
     if not diretorios:
-        print("\n[trajetoria] Nenhuma sessão com VEL_Y + ANGULAR_SPEED_Z encontrada.")
-        print("             Verifique se getVelocidade.py e extratorCandumpFiles.py rodaram.")
+        print("\n[trajetoria] Nenhuma sessão com RPM+ACC_X+YAW ou VEL+YAW encontrada.")
+        print("             Verifique se os extratores e getVelocidade.py rodaram.")
         # Não é erro fatal — sessões sem IMU podem existir
         return True
 
@@ -172,7 +233,7 @@ def etapa_calcular_trajetoria(negar_yaw: bool = False) -> bool:
     for d in diretorios:
         print(f"  {d.relative_to(DIR_BASE)}")
 
-    flags_extras = ["--negar-yaw"] if negar_yaw else []
+    flags_extras = flags_get_trajetoria_extras(negar_yaw)
 
     resultado = subprocess.run(
         [sys.executable, str(SCRIPT_GET_TRAJETORIA),
@@ -197,6 +258,16 @@ def main():
     pular_extratores = "--skip-extract" in flags or "--only-plot" in flags
     pular_plotador   = "--skip-plot" in flags
     negar_yaw        = "--negar-yaw" in flags
+    no_track_map     = "--no-track-map" in flags or "--no-mini-slam" in flags
+    lap_cli          = any(
+        a.startswith("--lap-period-sec=") or a == "--lap-period-sec"
+        for a in sys.argv[1:]
+    )
+    bias_cli         = any(
+        a.startswith("--bias-yaw-bordas-sec=") or a == "--bias-yaw-bordas-sec"
+        for a in sys.argv[1:]
+    )
+    velo_cli         = "--sem-janela-movimento" in flags or "--sem-rampa-drift" in flags
 
     # Monta a sequência de etapas com base nas flags
     etapas = []
@@ -216,6 +287,14 @@ def main():
     print(f"  Etapas: {', '.join(nome for nome, _ in etapas)}")
     if negar_yaw:
         print("  [flag] --negar-yaw ativo")
+    if no_track_map:
+        print("  [flag] tracking no mapa da 1ª volta desativado")
+    if lap_cli:
+        print("  [flag] --lap-period-sec repassado ao getTrajetoria")
+    if bias_cli:
+        print("  [flag] --bias-yaw-bordas-sec repassado ao getTrajetoria")
+    if velo_cli:
+        print("  [flag] opções getVelocidade (--sem-janela-movimento / --sem-rampa-drift) ativas")
 
     # Executa cada etapa em sequência; interrompe na primeira falha
     for nome_etapa, funcao_etapa in etapas:

@@ -260,6 +260,8 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
     """
     caminho_x = pasta / "TRAJETORIA_X.csv"
     caminho_y = pasta / "TRAJETORIA_Y.csv"
+    caminho_mapa_x = pasta / "MAPA_BASE_X.csv"
+    caminho_mapa_y = pasta / "MAPA_BASE_Y.csv"
 
     if not caminho_x.exists() or not caminho_y.exists():
         return False
@@ -273,6 +275,13 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
     x = df_x["dado"].str.extract(r"([-\d.]+)", expand=False).astype(float).to_numpy()
     y = df_y["dado"].str.extract(r"([-\d.]+)", expand=False).astype(float).to_numpy()
     t = df_x["timestamp"].to_numpy()
+    mapa_x = mapa_y = None
+    if caminho_mapa_x.exists() and caminho_mapa_y.exists():
+        df_mapa_x = pd.read_csv(caminho_mapa_x)
+        df_mapa_y = pd.read_csv(caminho_mapa_y)
+        if not df_mapa_x.empty and not df_mapa_y.empty:
+            mapa_x = df_mapa_x["dado"].str.extract(r"([-\d.]+)", expand=False).astype(float).to_numpy()
+            mapa_y = df_mapa_y["dado"].str.extract(r"([-\d.]+)", expand=False).astype(float).to_numpy()
 
     # Usa comprimento mínimo caso os dois CSVs tenham tamanhos ligeiramente diferentes
     n = min(len(x), len(y))
@@ -286,6 +295,20 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
     cor_traj = "#39d3d3"
 
     fig, ax = plt.subplots(figsize=(8, 8))
+
+    if mapa_x is not None and mapa_y is not None:
+        n_mapa = min(len(mapa_x), len(mapa_y))
+        mapa_x = mapa_x[:n_mapa]
+        mapa_y = mapa_y[:n_mapa]
+        ax.plot(
+            mapa_x,
+            mapa_y,
+            color="#f2cc60",
+            linewidth=2.2,
+            alpha=0.85,
+            label="Mapa base (1ª volta)",
+            zorder=2,
+        )
 
     # Linha da trajetória com gradiente de alpha simulado por segmentos
     n_segmentos = min(n - 1, 500)
@@ -356,7 +379,7 @@ def plotar_trajetoria(pasta: Path, diretorio_plots: Path) -> bool:
 
 # Sinais que não devem ser plotados individualmente como série temporal —
 # são consumidos pelo plot combinado de trajetória.
-_SINAIS_TRAJETORIA = {"TRAJETORIA_X", "TRAJETORIA_Y"}
+_SINAIS_TRAJETORIA = {"TRAJETORIA_X", "TRAJETORIA_Y", "MAPA_BASE_X", "MAPA_BASE_Y"}
 
 
 def processar_pasta(pasta: Path) -> None:
